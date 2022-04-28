@@ -1,0 +1,17 @@
+.ftpignore
+.ftpconfig
+.vscode
+
+# Byte-compiled / optimized / DLL files
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+*$py.class
+*.swp
+
+saved_models
+datasets
+datasets.zip
+!datasets/.gitkeep
+
+Matterport3DSimulator/
