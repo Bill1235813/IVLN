@@ -3,6 +3,7 @@
 import json
 import os
 from socket import IP_DEFAULT_MULTICAST_LOOP
+from itertools import chain
 import numpy as np
 import math
 import random
@@ -89,24 +90,21 @@ class R2RBatch(object):
     def __init__(
         self, feat_db, instr_data, connectivity_dir,
         batch_size=64, angle_feat_size=4,
-        seed=0, name=None, sel_data_idxs=None
+        seed=0, name=None, sel_data_idxs=None, iterative=False
     ):
         self.env = EnvBatch(connectivity_dir, feat_db=feat_db, batch_size=batch_size)
-        self.data = instr_data #[:4] ##Reduce datasize
+        self.data = instr_data
         self.scans = set([x['scan'] for x in self.data])
-        # to evaluate full data
         self.gt_trajs = self._get_gt_trajs(self.data)
 
-        # in validation, we would split the data
-        if sel_data_idxs is not None:
-            t_split, n_splits = sel_data_idxs
-            ndata_per_split = len(self.data) // n_splits 
-            start_idx = ndata_per_split * t_split
-            if t_split == n_splits - 1:
-                end_idx = None
-            else:
-                end_idx = start_idx + ndata_per_split
-            self.data = self.data[start_idx: end_idx]
+        if name == 'aug':
+            tour_data = json.load(open("../tours_iVLN_prevalent.json"))
+            tour_data = tour_data["prevalent"]
+        else:
+            tour_data = json.load(open("../tours_iVLN.json"))
+            tour_data = tour_data[name]
+        self.tour_data = list(chain.from_iterable(tour_data.values()))
+        self.tour_batch = None
 
         self.connectivity_dir = connectivity_dir
         self.angle_feat_size = angle_feat_size
@@ -114,7 +112,12 @@ class R2RBatch(object):
         # use different seeds in different processes to shuffle data
         self.seed = seed
         random.seed(self.seed)
-        random.shuffle(self.data)
+        if iterative:
+            self.iterative = True
+            self.data = {ex["instr_id"]:ex for ex in self.data}
+            random.shuffle(self.tour_data)
+        else:
+            random.shuffle(self.data)
 
         self.ix = 0
         self.batch_size = batch_size
@@ -128,6 +131,8 @@ class R2RBatch(object):
                     {loc['nextViewpointId']:loc['absViewIndex'] for loc in locs[1:]}
         print('%s loaded with %d instructions, using splits: %s' % (
             self.__class__.__name__, len(self.data), self.name))
+        print('%s loaded with %d tours, using splits: %s' % (
+            self.__class__.__name__, len(self.tour_data), self.name))
 
     def _get_gt_trajs(self, data):
         return {x['instr_id']: (x['scan'], x['path']) for x in data}
@@ -135,6 +140,10 @@ class R2RBatch(object):
     def size(self):
         return len(self.data)
 
+    def check_last(self):
+        # todo: only batch size 1
+        return self.tour_batch is None or self.batch[0]['instr_id'] == self.tour_batch[0][-1]
+    
     def _load_nav_graphs(self):
         """
         load graph from self.scan,
@@ -162,20 +171,38 @@ class R2RBatch(object):
         if batch_size is None:
             batch_size = self.batch_size
         
-        batch = self.data[self.ix: self.ix+batch_size]
-        if len(batch) < batch_size:
-            random.shuffle(self.data)
-            self.ix = batch_size - len(batch)
-            batch += self.data[:self.ix]
+        if self.iterative:
+            if self.check_last():
+                batch = self.tour_data[self.ix: self.ix + batch_size]
+                if len(batch) < batch_size:
+                    random.shuffle(self.tour_data)
+                    self.ix = batch_size - len(batch)
+                    batch += self.tour_data[:self.ix]
+                else:
+                    self.ix += batch_size
+                self.tour_batch = batch
+                self.tour_batch_probe = np.array([-1] * batch_size)
+            self.tour_batch_probe += 1
+            self.batch = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] for i in range(batch_size)]
         else:
-            self.ix += batch_size
-        self.batch = batch
+            batch = self.data[self.ix: self.ix+batch_size]
+            if len(batch) < batch_size:
+                random.shuffle(self.data)
+                self.ix = batch_size - len(batch)
+                batch += self.data[:self.ix]
+            else:
+                self.ix += batch_size
+            self.batch = batch
 
     def reset_epoch(self, shuffle=False):
         ''' Reset the data index to beginning of epoch. Primarily for testing.
             You must still call reset() for a new episode. '''
         if shuffle:
-            random.shuffle(self.data)
+            if self.iterative:
+                random.shuffle(self.tour_data)
+            else:
+                random.shuffle(self.data)
+        self.tour_batch = None
         self.ix = 0
 
     def _shortest_path_action(self, state, goalViewpointId):
@@ -355,6 +382,9 @@ class R2RBatch(object):
             for k, v in traj_scores.items():
                 metrics[k].append(v)
             metrics['instr_id'].append(instr_id)
+            metrics['gt_path'].append(item['gt_path'])
+            metrics['gt_length'].append(item['gt_length'])
+
         
         avg_metrics = {
             'steps': np.mean(metrics['trajectory_steps']),

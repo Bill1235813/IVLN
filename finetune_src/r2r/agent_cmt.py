@@ -82,6 +82,7 @@ class Seq2SeqCMTAgent(BaseAgent):
 
         # Logs
         sys.stdout.flush()
+        self.history = None
         self.logs = defaultdict(list)
 
     def _build_model(self):
@@ -245,7 +246,7 @@ class Seq2SeqCMTAgent(BaseAgent):
     #             if traj is not None:
     #                 traj[i]['path'].append((state.location.viewpointId, state.heading, state.elevation))
 
-    def rollout(self, train_ml=None, train_rl=True, reset=True):
+    def rollout(self, train_ml=None, train_rl=True, reset=True, history=False):
         """
         :param train_ml:    The weight to train with maximum likelihood
         :param train_rl:    whether use RL in training
@@ -277,6 +278,8 @@ class Seq2SeqCMTAgent(BaseAgent):
         # Record starting point
         traj = [{
             'instr_id': ob['instr_id'],
+            'gt_path': ob['gt_path'],
+            'gt_length': ob['distance'],
             'path': [(ob['viewpoint'], ob['heading'], ob['elevation'])],
         } for ob in obs]
 
@@ -301,9 +304,12 @@ class Seq2SeqCMTAgent(BaseAgent):
 
         # for backtrack
         visited = [set() for _ in range(batch_size)]
-
-        hist_embeds = [self.vln_bert('history').expand(batch_size, -1)]  # global embedding
-        hist_lens = [1 for _ in range(batch_size)]
+        if not history or self.history is None:
+            hist_embeds = [self.vln_bert('history').expand(batch_size, -1)]  # global embedding
+            hist_lens = [1 for _ in range(batch_size)]
+        else:
+            hist_embeds = self.history
+            hist_lens = [len(hist) for hist in self.history]
 
         for t in range(self.args.max_action_len):
             if self.args.ob_type == 'pano':
@@ -394,6 +400,8 @@ class Seq2SeqCMTAgent(BaseAgent):
                 }
                 t_hist_embeds = self.vln_bert(**t_hist_inputs)
                 hist_embeds.append(t_hist_embeds)
+                if len(hist_embeds) > 50:
+                    hist_embeds = hist_embeds[-50:] # todo: remove hard code
 
                 for i, i_ended in enumerate(ended):
                     if not i_ended:
@@ -535,7 +543,7 @@ class Seq2SeqCMTAgent(BaseAgent):
         else:
             self.vln_bert.eval()
             self.critic.eval()
-        super().test(iters=iters)
+        super().test(iters=iters, history=self.args.extended_history)
 
     def zero_grad(self):
         self.loss = 0.
@@ -572,29 +580,46 @@ class Seq2SeqCMTAgent(BaseAgent):
         self.critic.train()
 
         self.losses = []
+        self.history = None
         for iter in range(1, n_iters + 1):
 
             self.vln_bert_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
 
-            self.loss = 0
-
-            if feedback == 'teacher':
-                self.feedback = 'teacher'
-                self.rollout(train_ml=self.args.teacher_weight, train_rl=False, **kwargs)
-            elif feedback == 'sample':  # agents in IL and RL separately
-                if self.args.ml_weight != 0:
-                    self.feedback = 'teacher'
-                    self.rollout(train_ml=self.args.ml_weight, train_rl=False, **kwargs)
-                self.feedback = 'sample'
-                self.rollout(train_ml=None, train_rl=True, **kwargs)
+            if self.args.iterative:
+                while True:
+                    self.loss = 0
+                    if feedback == 'teacher':
+                        self.feedback = 'teacher'
+                        self.rollout(train_ml=self.args.teacher_weight, train_rl=False, history=self.args.extended_history, **kwargs)
+                    elif feedback == 'sample':  # agents in IL and RL separately
+                        if self.args.ml_weight != 0:
+                            self.feedback = 'teacher'
+                            self.rollout(train_ml=self.args.ml_weight, train_rl=False, history=self.args.extended_history, **kwargs)
+                        self.feedback = 'sample'
+                        self.rollout(train_ml=None, train_rl=True, **kwargs)
+                    else:
+                        assert False
+                    self.loss.backward()
+                    if self.env.check_last():
+                        self.history = None
+                        break
             else:
-                assert False
+                self.loss = 0
+                if feedback == 'teacher':
+                    self.feedback = 'teacher'
+                    self.rollout(train_ml=self.args.teacher_weight, train_rl=False, **kwargs)
+                elif feedback == 'sample':  # agents in IL and RL separately
+                    if self.args.ml_weight != 0:
+                        self.feedback = 'teacher'
+                        self.rollout(train_ml=self.args.ml_weight, train_rl=False, **kwargs)
+                    self.feedback = 'sample'
+                    self.rollout(train_ml=None, train_rl=True, **kwargs)
+                else:
+                    assert False
+                self.loss.backward()
 
-            #print(self.rank, iter, self.loss)
-            self.loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(self.vln_bert.parameters(), 40.)
+            # torch.nn.utils.clip_grad_norm_(self.vln_bert.parameters(), 40.)
 
             self.vln_bert_optimizer.step()
             self.critic_optimizer.step()

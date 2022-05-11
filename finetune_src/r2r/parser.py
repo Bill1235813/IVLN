@@ -7,20 +7,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="")
 
     # Ours
-    parser.add_argument('--mmvl', action='store_true', default=False, help='multi-modal share space training')
+    parser.add_argument('--iterative', action='store_true', default=False, help='iterative training')
+    parser.add_argument('--extended_history', action='store_true', default=False, help='use extended history')
     
-    # Our model
-    parser.add_argument('--mmvl_encoder', type=str, default='gru', choices=['gru', 'lstm'])
-    parser.add_argument('--mmvl_encoder_layers', type=int, default=1)
-    parser.add_argument('--num_vl_layers', type=int, default=0, help='multi-modal layer for the MMMTVLN model')
-    
-    # Our training
-    parser.add_argument('--action_pred_x_obs', action='store_true', default=False, help="prediction action using O'_t")
-    parser.add_argument('--l2_loss', action='store_true', default=False, help='use L2 instead of KL')
-    parser.add_argument('--prior_loss', action='store_true', default=False, help='additional prior loss')
-    parser.add_argument('--t_start', action='store_true', default=False, help='traj encoding starts from t')
-    parser.add_argument('--t_end', type=int, default=-1, help='traj encoding ends at t + t_end (t_end future steps), -1 --> ends at T')
-
     parser.add_argument('--root_dir', type=str, default='../datasets')
     parser.add_argument(
         '--dataset', type=str, default='r2r', 

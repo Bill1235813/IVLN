@@ -15,7 +15,7 @@ from utils.distributed import all_gather, merge_dist_results
 from models.vlnbert_init import get_tokenizer
 
 from r2r.agent_cmt import Seq2SeqCMTAgent
-from r2r.agent_cmt_mmmtvln import Seq2SeqMMMTVLNAgent
+# from r2r.agent_cmt_mmmtvln import Seq2SeqMMMTVLNAgent
 
 from r2r.agent_r2rback import Seq2SeqBackAgent
 from r2r.data_utils import ImageFeaturesDB, construct_instrs
@@ -44,7 +44,7 @@ def build_dataset(args, rank=0, is_test=False):
     train_env = dataset_class(
         feat_db, train_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
         angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
-        sel_data_idxs=None, name='train'
+        sel_data_idxs=None, name='train', iterative=args.iterative
     )
     if args.aug is not None:
         aug_instr_data = construct_instrs(
@@ -54,12 +54,12 @@ def build_dataset(args, rank=0, is_test=False):
         aug_env = dataset_class(
             feat_db, aug_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
-            sel_data_idxs=None, name='aug'
+            sel_data_idxs=None, name='aug', iterative=args.iterative
         )
     else:
         aug_env = None
 
-    val_env_names = ['val_train_seen', 'val_seen']
+    val_env_names = ['val_seen']
     if args.test or args.dataset != 'r4r':
         val_env_names.append('val_unseen')
     else:   # val_unseen of r4r is too large to evaluate in training
@@ -80,7 +80,7 @@ def build_dataset(args, rank=0, is_test=False):
         val_env = dataset_class(
             feat_db, val_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
-            sel_data_idxs=None if args.world_size < 2 else (rank, args.world_size), name=split
+            sel_data_idxs=None if args.world_size < 2 else (rank, args.world_size), name=split, iterative=args.iterative
         )
         val_envs[split] = val_env
 
@@ -99,8 +99,6 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
 
     if args.dataset == 'r2r_back':
         agent_class = Seq2SeqBackAgent
-    elif args.mmvl:
-        agent_class = Seq2SeqMMMTVLNAgent
     else:
         agent_class = Seq2SeqCMTAgent
     listner = agent_class(args, train_env, rank=rank)
@@ -140,9 +138,9 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
         )
 
     if args.dataset == 'r4r':
-        best_val = {'val_unseen_sampled': {"spl": 0., "sr": 0., "state":""}}
+        best_val = {'val_unseen_sampled': {"spl": 0., "sr": 0., "t-spl": 0., "t-sr": 0., "state":""}}
     else:
-        best_val = {'val_unseen': {"spl": 0., "sr": 0., "state":""}}
+        best_val = {'val_unseen': {"spl": 0., "sr": 0., "t-spl": 0., "t-sr": 0., "state":""}}
     
     for idx in range(start_iter, start_iter+args.iters, args.log_every):
         listner.logs = defaultdict(list)
@@ -177,25 +175,17 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
             policy_loss = sum(listner.logs['policy_loss']) / total
             RL_loss = sum(listner.logs['RL_loss']) / max(len(listner.logs['RL_loss']), 1)
             IL_loss = sum(listner.logs['IL_loss']) / max(len(listner.logs['IL_loss']), 1)
-            KL_loss = sum(listner.logs['KL_loss']) / max(len(listner.logs['KL_loss']), 1)
-            L2_loss = sum(listner.logs['L2_loss']) / max(len(listner.logs['L2_loss']), 1)
-            Act_loss = sum(listner.logs['Act_loss']) / max(len(listner.logs['Act_loss']), 1)
-            PriorAct_loss = sum(listner.logs['PriorAct_loss']) / max(len(listner.logs['PriorAct_loss']), 1)
             entropy = sum(listner.logs['entropy']) / total
             writer.add_scalar("loss/critic", critic_loss, idx)
             writer.add_scalar("policy_entropy", entropy, idx)
             writer.add_scalar("loss/RL_loss", RL_loss, idx)
             writer.add_scalar("loss/IL_loss", IL_loss, idx)
-            writer.add_scalar("loss/KL_loss", KL_loss, idx)
-            writer.add_scalar("loss/L2_loss", L2_loss, idx)
-            writer.add_scalar("loss/Act_loss", Act_loss, idx)
-            writer.add_scalar("loss/PriorAct_loss", PriorAct_loss, idx)
             writer.add_scalar("total_actions", total, idx)
             writer.add_scalar("max_length", length, idx)
             write_to_record_file(
-                "\ntotal_actions %d, max_length %d, entropy %.4f, IL_loss %.4f, KL_loss %.4f, L2_loss %.4f, "
-                "Act_loss %.4f, PriorAct_loss %.4f, RL_loss %.4f, policy_loss %.4f, critic_loss %.4f" % (
-                    total, length, entropy, IL_loss, KL_loss, L2_loss, Act_loss, PriorAct_loss, RL_loss, policy_loss, critic_loss),
+                "\ntotal_actions %d, max_length %d, entropy %.4f, IL_loss %.4f, "
+                "RL_loss %.4f, policy_loss %.4f, critic_loss %.4f" % (
+                    total, length, entropy, IL_loss, RL_loss, policy_loss, critic_loss),
                 record_file
             )
 
@@ -210,19 +200,56 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
             preds = merge_dist_results(all_gather(preds))
 
             if default_gpu:
-                score_summary, _ = env.eval_metrics(preds)
+                score_summary, all_metrics = env.eval_metrics(preds)
                 loss_str += ", %s " % env_name
                 for metric, val in score_summary.items():
                     loss_str += ', %s: %.2f' % (metric, val)
                     writer.add_scalar('%s/%s' % (metric, env_name), score_summary[metric], idx)
 
+                # process tour
+                all_tours = env.tour_data
+                all_tour_length = sum([len(tour) for tour in all_tours])
+                all_metric_dict = {}
+                for count, id in enumerate(all_metrics['instr_id']):
+                    all_metric_dict[id] = {
+                        metric_name: metric_values[count]
+                        for metric_name, metric_values in all_metrics.items()
+                    }
+                all_metrics = all_metric_dict
+
+                # compute tour metrics
+                sr, spl, ndtw = 0, 0, 0
+                for tour in all_tours:
+                    weight = len(tour) / all_tour_length
+                    inner_sr_list, inner_spl_list, inner_ndtw_list = [], [], []
+                    inner_weight_list = []
+                    for instr_id in tour:
+                        metrics = all_metrics[instr_id]
+                        inner_weight_list.append(
+                            max(metrics['gt_length'], metrics['trajectory_lengths']) / metrics['gt_length'])
+                        inner_sr_list.append(metrics['success'])
+                        inner_spl_list.append(metrics['spl'])
+                        inner_ndtw_list.append(metrics['nDTW'])
+                    inner_weight_list = np.array(inner_weight_list) / sum(inner_weight_list)
+                    sr += weight * (inner_weight_list * np.array(inner_sr_list)).sum()
+                    spl += weight * (inner_weight_list * np.array(inner_spl_list)).sum()
+                    ndtw += weight * (inner_weight_list * np.array(inner_ndtw_list)).sum()
+                loss_str += ', %s: %.2f' % ('t-sr', sr * 100)
+                loss_str += ', %s: %.2f' % ('t-spl', spl * 100)
+                loss_str += ', %s: %.2f' % ('t-nDTW', ndtw * 100)
+                
                 # select model by spl+sr
                 if env_name in best_val:
-                    if score_summary['spl'] + score_summary['sr'] >= best_val[env_name]['spl'] + best_val[env_name]['sr']:
-                        best_val[env_name]['spl'] = score_summary['spl']
-                        best_val[env_name]['sr'] = score_summary['sr']
-                        best_val[env_name]['state'] = 'Iter %d %s' % (iter, loss_str)
-                        listner.save(iter, os.path.join(args.ckpt_dir, "best_%s" % (env_name)))
+                    if args.iterative:
+                        if sr + spl >= best_val[env_name]['t-spl'] + best_val[env_name]['t-sr']:
+                            best_val[env_name]['t-spl'] = spl
+                            best_val[env_name]['t-sr'] = sr
+                    else:
+                        if score_summary['spl'] + score_summary['sr'] >= best_val[env_name]['spl'] + best_val[env_name]['sr']:
+                            best_val[env_name]['spl'] = score_summary['spl']
+                            best_val[env_name]['sr'] = score_summary['sr']
+                    best_val[env_name]['state'] = 'Iter %d %s' % (iter, loss_str)
+                    listner.save(iter, os.path.join(args.ckpt_dir, "best_%s" % (env_name)))
                 
         
         if default_gpu:
@@ -242,8 +269,6 @@ def valid(args, train_env, val_envs, rank=-1):
 
     if args.dataset == 'r2r_back':
         agent_class = Seq2SeqBackAgent
-    elif args.mmvl:
-        agent_class = Seq2SeqMMMTVLNAgent
     else:
         agent_class = Seq2SeqCMTAgent
     agent = agent_class(args, train_env, rank=rank)
@@ -272,10 +297,82 @@ def valid(args, train_env, val_envs, rank=-1):
 
         if default_gpu:
             if 'test' not in env_name:
-                score_summary, _ = env.eval_metrics(preds)
+                score_summary, all_metrics = env.eval_metrics(preds)
                 loss_str = "Env name: %s" % env_name
                 for metric, val in score_summary.items():
                     loss_str += ', %s: %.2f' % (metric, val)
+                
+                # process tour
+                all_tours = env.tour_data
+                all_tour_length = sum([len(tour) for tour in all_tours])
+
+                # # tour episodic metrics
+                # all_epi_metrics = {
+                #     'trajectory_steps': [],
+                #     'trajectory_lengths': [],
+                #     'nav_error': [],
+                #     'oracle_error': [],
+                #     'success': [],
+                #     'oracle_success': [],
+                #     'spl':[],
+                #     'nDTW':[],
+                #     'SDTW':[],
+                #     'CLS':[],
+                # }
+                # all_tour_ids = []
+                # for tour in all_tours:
+                #     all_tour_ids += tour
+                # for count, id in enumerate(all_metrics['instr_id']):
+                #     if id in all_tour_ids:
+                #         for name in all_epi_metrics:
+                #             all_epi_metrics[name].append(all_metrics[name][count])
+                # avg_metrics = {
+                #     'steps': np.mean(all_epi_metrics['trajectory_steps']),
+                #     'lengths': np.mean(all_epi_metrics['trajectory_lengths']),
+                #     'nav_error': np.mean(all_epi_metrics['nav_error']),
+                #     'oracle_error': np.mean(all_epi_metrics['oracle_error']),
+                #     'sr': np.mean(all_epi_metrics['success']) * 100,
+                #     'oracle_sr': np.mean(all_epi_metrics['oracle_success']) * 100,
+                #     'spl': np.mean(all_epi_metrics['spl']) * 100,
+                #     'nDTW': np.mean(all_epi_metrics['nDTW']) * 100,
+                #     'SDTW': np.mean(all_epi_metrics['SDTW']) * 100,
+                #     'CLS': np.mean(all_epi_metrics['CLS']) * 100,
+                # }
+                # epi_str = ''
+                # for metric, val in avg_metrics.items():
+                #     epi_str += ', %s: %.2f' % (metric, val)
+                # print(epi_str)
+                # print(set(all_metrics['instr_id']) - set(all_tour_ids))
+                
+                
+                # transform to tour metrics
+                all_metric_dict = {}
+                for count, id in enumerate(all_metrics['instr_id']):
+                    all_metric_dict[id] = {
+                        metric_name: metric_values[count]
+                        for metric_name, metric_values in all_metrics.items()
+                    }
+                all_metrics = all_metric_dict
+                
+                # compute tour metrics
+                sr, spl, ndtw = 0, 0, 0
+                for tour in all_tours:
+                    weight = len(tour) / all_tour_length
+                    inner_sr_list, inner_spl_list, inner_ndtw_list = [], [], []
+                    inner_weight_list = []
+                    for instr_id in tour:
+                        metrics = all_metrics[instr_id]
+                        inner_weight_list.append(max(metrics['gt_length'],metrics['trajectory_lengths']) / metrics['gt_length'])
+                        inner_sr_list.append(metrics['success'])
+                        inner_spl_list.append(metrics['spl'])
+                        inner_ndtw_list.append(metrics['nDTW'])
+                    inner_weight_list = np.array(inner_weight_list) / sum(inner_weight_list)
+                    sr += weight * (inner_weight_list * np.array(inner_sr_list)).sum()
+                    spl += weight * (inner_weight_list * np.array(inner_spl_list)).sum()
+                    ndtw += weight * (inner_weight_list * np.array(inner_ndtw_list)).sum()
+                loss_str += ', %s: %.2f' % ('t-sr', sr * 100)
+                loss_str += ', %s: %.2f' % ('t-spl', spl * 100)
+                loss_str += ', %s: %.2f' % ('t-nDTW', ndtw * 100)
                 write_to_record_file(loss_str+'\n', record_file)
 
             if args.submit:

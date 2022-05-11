@@ -9,7 +9,7 @@ class BaseAgent(object):
     def get_results(self, detailed_output=False):
         output = []
         for k, v in self.results.items():
-            output.append({'instr_id': k, 'trajectory': v['path']})
+            output.append({'instr_id': k, 'trajectory': v['path'], 'gt_path': v['gt_path'], 'gt_length': v['gt_length']})
             if detailed_output:
                 output[-1]['details'] = v['details']
         return output
@@ -29,12 +29,15 @@ class BaseAgent(object):
         # We rely on env showing the entire batch before repeating anything
         looped = False
         self.loss = 0
+        self.history = None
         if iters is not None:
             # For each time, it will run_r2r_il.sh the first 'iters' iterations. (It was shuffled before)
             for i in range(iters):
                 for traj in self.rollout(**kwargs):
                     self.loss = 0
                     self.results[traj['instr_id']] = traj
+                if self.env.check_last():
+                    self.history = None
         else:   # Do a full round
             while True:
                 for traj in self.rollout(**kwargs):
@@ -43,6 +46,8 @@ class BaseAgent(object):
                     else:
                         self.loss = 0
                         self.results[traj['instr_id']] = traj
+                if self.env.check_last():
+                    self.history = None
                 if looped:
                     break
 
