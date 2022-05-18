@@ -171,6 +171,37 @@ class Seq2SeqCMTAgent(BaseAgent):
         cand_nav_types = torch.from_numpy(cand_nav_types).cuda()
         return cand_img_feats, cand_ang_feats, cand_nav_types, cand_lens
 
+    def _future_variable(self, obs, t, stride=1):
+        fut_img_feats = np.zeros((len(obs), self.args.image_feat_size), np.float32)
+        fut_ang_feats = np.zeros((len(obs), self.args.angle_feat_size), np.float32)
+        for i, ob in enumerate(obs):
+            if t * stride < len(ob['gt_path_feats']):
+                fut_img_feats[i] = ob['gt_path_feats'][t][ob['gt_view_idxs'][t], :self.args.image_feat_size]
+                fut_ang_feats[i] = ob['gt_angle_feats'][t]
+            elif (t - 1) * stride + 1 < len(ob['gt_path_feats']):
+                fut_img_feats[i] = ob['gt_path_feats'][-1][ob['gt_view_idxs'][-1], :self.args.image_feat_size]
+                fut_ang_feats[i] = ob['gt_angle_feats'][-1]
+    
+        fut_img_feats = torch.from_numpy(fut_img_feats).cuda()
+        fut_ang_feats = torch.from_numpy(fut_ang_feats).cuda()
+    
+        if self.args.hist_enc_pano:
+            fut_pano_img_feats = np.zeros((len(obs), self.args.views, self.args.image_feat_size), np.float32)
+            fut_pano_ang_feats = np.zeros((len(obs), self.args.views, self.args.angle_feat_size), np.float32)
+            for i, ob in enumerate(obs):
+                if t * stride < len(ob['gt_path_feats']):
+                    fut_pano_img_feats[i] = ob['gt_path_feats'][t][:, :self.args.image_feat_size]
+                    fut_pano_ang_feats[i] = ob['gt_path_feats'][t][:, self.args.image_feat_size:]
+                elif (t - 1) * stride + 1 < len(ob['gt_path_feats']):
+                    fut_pano_img_feats[i] = ob['gt_path_feats'][-1][:, :self.args.image_feat_size]
+                    fut_pano_ang_feats[i] = ob['gt_path_feats'][-1][:, self.args.image_feat_size:]
+            fut_pano_img_feats = torch.from_numpy(fut_pano_img_feats).cuda()
+            fut_pano_ang_feats = torch.from_numpy(fut_pano_ang_feats).cuda()
+        else:
+            fut_pano_img_feats, fut_pano_ang_feats = None, None
+    
+        return fut_img_feats, fut_ang_feats, fut_pano_img_feats, fut_pano_ang_feats
+    
     def _history_variable(self, obs):
         hist_img_feats = np.zeros((len(obs), self.args.image_feat_size), np.float32)
         for i, ob in enumerate(obs):  
@@ -246,7 +277,7 @@ class Seq2SeqCMTAgent(BaseAgent):
     #             if traj is not None:
     #                 traj[i]['path'].append((state.location.viewpointId, state.heading, state.elevation))
 
-    def rollout(self, train_ml=None, train_rl=True, reset=True, history=False):
+    def rollout(self, train_ml=None, train_rl=True, reset=True, history=False, sep_hist=False):
         """
         :param train_ml:    The weight to train with maximum likelihood
         :param train_rl:    whether use RL in training
@@ -262,6 +293,22 @@ class Seq2SeqCMTAgent(BaseAgent):
         else:
             obs = self.env._get_obs(t=0)
 
+        if self.env.extra_obs is not None:
+            assert self.history is not None
+            future_lens = [len(ob['gt_path_feats']) for ob in self.env.extra_obs]
+            for t in range(max(future_lens) - 1):
+                t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats = self._future_variable(self.env.extra_obs, t)
+                t_fut_inputs = {
+                    'mode': 'history',
+                    'hist_img_feats': t_img_feats,
+                    'hist_ang_feats': t_ang_feats,
+                    'hist_pano_img_feats': t_pano_img_feats,
+                    'hist_pano_ang_feats': t_pano_ang_feats,
+                    'ob_step': t,
+                }
+                t_fut_embeds = self.vln_bert(**t_fut_inputs)
+                self.history.append(t_fut_embeds)
+        
         batch_size = len(obs)
 
         # Language input
@@ -305,11 +352,14 @@ class Seq2SeqCMTAgent(BaseAgent):
         # for backtrack
         visited = [set() for _ in range(batch_size)]
         if not history or self.history is None:
-            hist_embeds = [self.vln_bert('history').expand(batch_size, -1)]  # global embedding
+            self.history = [self.vln_bert('history').expand(batch_size, -1)]  # global embedding
             hist_lens = [1 for _ in range(batch_size)]
         else:
-            hist_embeds = self.history
-            hist_lens = [len(hist) for hist in self.history]
+            if sep_hist:
+                self.history.append(self.vln_bert('history').expand(batch_size, -1))
+            if len(self.history) > 50:
+                self.history = self.history[-50:]  # todo: remove hard code
+            hist_lens = [len(self.history)] # todo: only for batch size 1
 
         for t in range(self.args.max_action_len):
             if self.args.ob_type == 'pano':
@@ -324,7 +374,7 @@ class Seq2SeqCMTAgent(BaseAgent):
                 'mode': 'visual',
                 'txt_embeds': txt_embeds,
                 'txt_masks': txt_masks,
-                'hist_embeds': hist_embeds,    # history before t step
+                'hist_embeds': self.history,    # history before t step
                 'hist_lens': hist_lens,
                 'ob_img_feats': ob_img_feats,
                 'ob_ang_feats': ob_ang_feats,
@@ -399,9 +449,9 @@ class Seq2SeqCMTAgent(BaseAgent):
                     'ob_step': t,
                 }
                 t_hist_embeds = self.vln_bert(**t_hist_inputs)
-                hist_embeds.append(t_hist_embeds)
-                if len(hist_embeds) > 50:
-                    hist_embeds = hist_embeds[-50:] # todo: remove hard code
+                self.history.append(t_hist_embeds)
+                if len(self.history) > 50:
+                    self.history = self.history[-50:] # todo: remove hard code
 
                 for i, i_ended in enumerate(ended):
                     if not i_ended:
@@ -469,7 +519,7 @@ class Seq2SeqCMTAgent(BaseAgent):
                 'mode': 'visual',
                 'txt_embeds': txt_embeds,
                 'txt_masks': txt_masks,
-                'hist_embeds': hist_embeds,
+                'hist_embeds': self.history,
                 'hist_lens': hist_lens,
                 'ob_img_feats': ob_img_feats,
                 'ob_ang_feats': ob_ang_feats,
@@ -532,6 +582,24 @@ class Seq2SeqCMTAgent(BaseAgent):
         else:
             self.losses.append(self.loss.item() / self.args.max_action_len)  # This argument is useless.
 
+        if not self.env.check_reach():
+            assert self.history is not None
+            future_lens = [len(ob['gt_path_feats']) for ob in self.env.extra_obs]
+            for t in range(max(future_lens) - 1):
+                t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats = self._future_variable(self.env.extra_obs, t)
+                t_fut_inputs = {
+                    'mode': 'history',
+                    'hist_img_feats': t_img_feats,
+                    'hist_ang_feats': t_ang_feats,
+                    'hist_pano_img_feats': t_pano_img_feats,
+                    'hist_pano_ang_feats': t_pano_ang_feats,
+                    'ob_step': t,
+                }
+                t_fut_embeds = self.vln_bert(**t_fut_inputs)
+                self.history.append(t_fut_embeds)
+        if sep_hist:
+            self.history[0] = self.vln_bert('history', ob_step=-1).expand(batch_size, -1)
+            
         return traj
 
     def test(self, use_dropout=False, feedback='argmax', allow_cheat=False, iters=None):
@@ -543,7 +611,7 @@ class Seq2SeqCMTAgent(BaseAgent):
         else:
             self.vln_bert.eval()
             self.critic.eval()
-        super().test(iters=iters, history=self.args.extended_history)
+        super().test(iters=iters, history=self.args.extended_history, sep_hist=self.args.sep_hist)
 
     def zero_grad(self):
         self.loss = 0.
@@ -591,11 +659,13 @@ class Seq2SeqCMTAgent(BaseAgent):
                     self.loss = 0
                     if feedback == 'teacher':
                         self.feedback = 'teacher'
-                        self.rollout(train_ml=self.args.teacher_weight, train_rl=False, history=self.args.extended_history, **kwargs)
+                        self.rollout(train_ml=self.args.teacher_weight, train_rl=False,
+                                     history=self.args.extended_history, sep_hist=self.args.sep_hist, **kwargs)
                     elif feedback == 'sample':  # agents in IL and RL separately
                         if self.args.ml_weight != 0:
                             self.feedback = 'teacher'
-                            self.rollout(train_ml=self.args.ml_weight, train_rl=False, history=self.args.extended_history, **kwargs)
+                            self.rollout(train_ml=self.args.ml_weight, train_rl=False,
+                                         history=self.args.extended_history, sep_hist=self.args.sep_hist, **kwargs)
                         self.feedback = 'sample'
                         self.rollout(train_ml=None, train_rl=True, **kwargs)
                     else:

@@ -105,6 +105,7 @@ class R2RBatch(object):
             tour_data = tour_data[name]
         self.tour_data = list(chain.from_iterable(tour_data.values()))
         self.tour_batch = None
+        self.extra_obs = None
 
         self.connectivity_dir = connectivity_dir
         self.angle_feat_size = angle_feat_size
@@ -144,6 +145,23 @@ class R2RBatch(object):
         # todo: only batch size 1
         return self.tour_batch is None or self.batch[0]['instr_id'] == self.tour_batch[0][-1]
     
+    def check_reach(self):
+        # todo: only batch size 1
+        if self.batch[0]['path'][-1] == self.env.world_states[0].viewpoint_id:
+            return True
+        else:
+            batch_tmp = self.batch
+            self.batch = [
+                {
+                    'heading': self.env.world_states[0].heading,
+                    'path': self.shortest_paths[self.env.world_states[0].scan_id][
+                        self.env.world_states[0].viewpoint_id][self.batch[0]['path'][-1]]
+                }
+            ]
+            self.extra_obs = self.get_path_obs()
+            self.batch = batch_tmp
+            return False
+    
     def _load_nav_graphs(self):
         """
         load graph from self.scan,
@@ -181,8 +199,19 @@ class R2RBatch(object):
                 else:
                     self.ix += batch_size
                 self.tour_batch = batch
-                self.tour_batch_probe = np.array([-1] * batch_size)
-            self.tour_batch_probe += 1
+                self.tour_batch_probe = np.array([0] * batch_size)
+                self.extra_obs = None
+            else:
+                self.tour_batch_probe += 1
+                batch_tmp = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] for i in range(batch_size)]
+                for i in range(batch_size):
+                    if self.env.world_states[i].viewpoint_id != batch_tmp[i]['path'][0]:
+                        batch_tmp[i] = {
+                            'heading': self.env.world_states[i].heading,
+                            'path': self.shortest_paths[self.env.world_states[i].scan_id][self.env.world_states[i].viewpoint_id][batch_tmp[i]['path'][0]]
+                        }
+                self.batch = batch_tmp
+                self.extra_obs = self.get_path_obs()
             self.batch = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] for i in range(batch_size)]
         else:
             batch = self.data[self.ix: self.ix+batch_size]

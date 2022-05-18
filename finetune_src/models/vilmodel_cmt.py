@@ -524,6 +524,7 @@ class HistoryEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
+        self.prev_hist_token = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
 
         self.img_linear = nn.Linear(config.image_feat_size, config.hidden_size)
         self.img_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
@@ -567,9 +568,14 @@ class HistoryEmbeddings(nn.Module):
         type_embeddings = self.type_embedding(type_ids)
 
         if img_feats is None:
-            cls_embeddings = self.dropout(self.layer_norm(
-                self.cls_token.expand(batch_size, -1, -1)[:, 0] + type_embeddings))
-            return cls_embeddings
+            if pos_ids is None:
+                cls_embeddings = self.dropout(self.layer_norm(
+                    self.cls_token.expand(batch_size, -1, -1)[:, 0] + type_embeddings))
+                return cls_embeddings
+            else:
+                prev_hist_embeddings = self.dropout(self.layer_norm(
+                    self.prev_hist_token.expand(batch_size, -1, -1)[:, 0] + type_embeddings))
+                return prev_hist_embeddings
 
         # history embedding per step
         embeddings = self.img_layer_norm(self.img_linear(img_feats)) + \

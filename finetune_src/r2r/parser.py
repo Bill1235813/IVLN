@@ -9,6 +9,8 @@ def parse_args():
     # Ours
     parser.add_argument('--iterative', action='store_true', default=False, help='iterative training')
     parser.add_argument('--extended_history', action='store_true', default=False, help='use extended history')
+    parser.add_argument('--sep_hist', action='store_true', default=False, help='use separate tag for prev and curr hist')
+
     
     parser.add_argument('--root_dir', type=str, default='../datasets')
     parser.add_argument(
