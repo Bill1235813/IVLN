@@ -146,7 +146,7 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
         listner.logs = defaultdict(list)
         interval = min(args.log_every, args.iters-idx)
         iter = idx + interval
-        # import ipdb; ipdb.set_trace()
+
         # Train for log_every interval
         if aug_env is None:
             listner.env = train_env

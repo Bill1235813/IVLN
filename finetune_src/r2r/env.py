@@ -117,6 +117,7 @@ class R2RBatch(object):
             self.iterative = True
             self.data = {ex["instr_id"]:ex for ex in self.data}
             random.shuffle(self.tour_data)
+            # self.tour_data = self.tour_data[90:]
         else:
             random.shuffle(self.data)
 

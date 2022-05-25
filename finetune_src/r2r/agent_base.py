@@ -30,6 +30,7 @@ class BaseAgent(object):
         looped = False
         self.loss = 0
         self.history = None
+        self.history_raw = None
         if iters is not None:
             # For each time, it will run_r2r_il.sh the first 'iters' iterations. (It was shuffled before)
             for i in range(iters):
