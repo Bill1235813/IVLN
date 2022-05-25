@@ -20,7 +20,7 @@ ft_dim=768
 ngpus=1
 seed=0
 
-outdir=../saved_models/R2R/vitbase-finetune-iterative-il-hist-sep-trainhist2
+outdir=../saved_models/R2R/vitbase-finetune-iterative-il-hist-sep-trainhist
 
 flag="--root_dir ../datasets
       --output_dir ${outdir}
