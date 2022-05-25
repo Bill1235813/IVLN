@@ -46,7 +46,6 @@ flag="--root_dir ../datasets
       --hist_pano_num_layers 2
 
       --fix_lang_embedding
-      --fix_hist_embedding
 
       --features ${features}
       --feedback ${feedback}
