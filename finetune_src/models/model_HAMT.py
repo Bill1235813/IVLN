@@ -36,7 +36,7 @@ class VLNBertCMT(nn.Module):
             if hist_pano_img_feats is not None:
                 hist_pano_img_feats = self.drop_env(hist_pano_img_feats)
             if ob_step is not None:
-                ob_step_ids = torch.LongTensor([ob_step]).cuda()
+                ob_step_ids = torch.LongTensor(ob_step).cuda()
             else:
                 ob_step_ids = None
             hist_embeds = self.vln_bert(mode, hist_img_feats=hist_img_feats, 
@@ -46,7 +46,6 @@ class VLNBertCMT(nn.Module):
             return hist_embeds
 
         elif mode == 'visual':
-            hist_embeds = torch.stack(hist_embeds, 1)
             hist_masks = length2mask(hist_lens, size=hist_embeds.size(1)).logical_not()
             
             ob_img_feats = self.drop_env(ob_img_feats)
@@ -75,7 +74,6 @@ class VLNBertCMT(nn.Module):
 
         elif mode == 'visual_only':
             # only X'_t and [H'_t, O'_t], no action logits
-            hist_embeds = torch.stack(hist_embeds, 1)
             hist_masks = length2mask(hist_lens, size=hist_embeds.size(1)).logical_not()
 
             ob_img_feats = self.drop_env(ob_img_feats)
@@ -89,7 +87,6 @@ class VLNBertCMT(nn.Module):
 
         elif mode == 'cross_only':
             # only X'_t and [H'_t, O'_t], no action logits
-            hist_embeds = torch.stack(hist_embeds, 1)
             hist_masks = length2mask(hist_lens, size=hist_embeds.size(1)).logical_not()
 
             txt_embeds, hist_embeds, ob_embeds = self.vln_bert(

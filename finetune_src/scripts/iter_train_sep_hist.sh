@@ -20,7 +20,7 @@ ft_dim=768
 ngpus=1
 seed=0
 
-outdir=../saved_models/R2R/vitbase-finetune-iterative-il-hist-sep-trainhist
+outdir=../saved_models/R2R/vitbase-finetune-iterative-il-trainhist-sep-b8
 
 flag="--root_dir ../datasets
       --output_dir ${outdir}
@@ -29,7 +29,6 @@ flag="--root_dir ../datasets
       --extended_history
       --sep_hist
       --rebuild
-
 
       --dataset r2r
 
@@ -59,8 +58,8 @@ flag="--root_dir ../datasets
 
       --lr 1e-5
       --iters 10000
-      --log_every 300
-      --batch_size 1
+      --log_every 200
+      --batch_size 8
       --optim adamW
 
       --ml_weight 0.2

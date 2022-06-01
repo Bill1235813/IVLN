@@ -2,7 +2,6 @@
 
 import json
 import os
-from socket import IP_DEFAULT_MULTICAST_LOOP
 from itertools import chain
 import numpy as np
 import math
@@ -25,7 +24,7 @@ class EnvBatch(object):
     ''' A simple wrapper for a batch of MatterSim environments,
         using discretized viewpoints and pretrained features '''
 
-    def __init__(self, connectivity_dir, scan_data_dir=None, feat_db=None, batch_size=100):
+    def __init__(self, feat_db=None, batch_size=100):
         """
         1. Load pretrained image feature
         2. Init the Simulator.
@@ -37,12 +36,14 @@ class EnvBatch(object):
         with open("../datasets/total_adj_list.json") as f:
             self.adj_dict = json.load(f)
 
-    def _make_id(self, scanId, viewpointId):
-        return scanId + '_' + viewpointId
+    # def _make_id(self, scanId, viewpointId):
+    #     return scanId + '_' + viewpointId
 
     def newEpisodes(self, scanIds, viewpointIds, headings):
         elevation = 0.0
         for i, (scanId, viewpointId, heading) in enumerate(zip(scanIds, viewpointIds, headings)):
+            if scanId is None:
+                continue
             view_index = (12 * round(elevation / ANGLE_INC + 1) + round(heading / ANGLE_INC) % 12)
             heading = (view_index - (12 * round(elevation / ANGLE_INC + 1))) * ANGLE_INC
             self.world_states[i] = WorldState(
@@ -90,9 +91,9 @@ class R2RBatch(object):
     def __init__(
         self, feat_db, instr_data, connectivity_dir,
         batch_size=64, angle_feat_size=4,
-        seed=0, name=None, sel_data_idxs=None, iterative=False
+        seed=0, name=None, iterative=False
     ):
-        self.env = EnvBatch(connectivity_dir, feat_db=feat_db, batch_size=batch_size)
+        self.env = EnvBatch(feat_db=feat_db, batch_size=batch_size)
         self.data = instr_data
         self.scans = set([x['scan'] for x in self.data])
         self.gt_trajs = self._get_gt_trajs(self.data)
@@ -110,19 +111,19 @@ class R2RBatch(object):
         self.connectivity_dir = connectivity_dir
         self.angle_feat_size = angle_feat_size
         self.name = name
-        # use different seeds in different processes to shuffle data
         self.seed = seed
         random.seed(self.seed)
         if iterative:
             self.iterative = True
             self.data = {ex["instr_id"]:ex for ex in self.data}
             random.shuffle(self.tour_data)
-            # self.tour_data = self.tour_data[90:]
         else:
+            self.iterative = False
             random.shuffle(self.data)
 
         self.ix = 0
         self.batch_size = batch_size
+        self.tour_ended = [False] * self.batch_size
         self._load_nav_graphs()
         self.angle_feature = np.load("../datasets/angle_feature.npy")
         self.angle_direct_dict = {}
@@ -136,33 +137,6 @@ class R2RBatch(object):
         print('%s loaded with %d tours, using splits: %s' % (
             self.__class__.__name__, len(self.tour_data), self.name))
 
-    def _get_gt_trajs(self, data):
-        return {x['instr_id']: (x['scan'], x['path']) for x in data}
-
-    def size(self):
-        return len(self.data)
-
-    def check_last(self):
-        # todo: only batch size 1
-        return self.tour_batch is None or self.batch[0]['instr_id'] == self.tour_batch[0][-1]
-    
-    def check_reach(self):
-        # todo: only batch size 1
-        if self.batch[0]['path'][-1] == self.env.world_states[0].viewpoint_id:
-            return True
-        else:
-            batch_tmp = self.batch
-            self.batch = [
-                {
-                    'heading': self.env.world_states[0].heading,
-                    'path': self.shortest_paths[self.env.world_states[0].scan_id][
-                        self.env.world_states[0].viewpoint_id][self.batch[0]['path'][-1]]
-                }
-            ]
-            self.extra_obs = self.get_path_obs()
-            self.batch = batch_tmp
-            return False
-    
     def _load_nav_graphs(self):
         """
         load graph from self.scan,
@@ -180,6 +154,47 @@ class R2RBatch(object):
         self.shortest_distances = {}
         for scan, G in self.graphs.items():  # compute all shortest paths
             self.shortest_distances[scan] = dict(nx.all_pairs_dijkstra_path_length(G))
+            
+    def _get_gt_trajs(self, data):
+        return {x['instr_id']: (x['scan'], x['path']) for x in data}
+
+    def size(self):
+        return len(self.data)
+
+    def check_last(self):
+        if self.tour_batch is None: # start of env
+            return True
+        else:
+            last = True
+            for i in range(self.batch_size):
+                if self.batch[i] is not None and self.batch[i]['instr_id'] != self.tour_batch[i][-1]:
+                    last = False
+                else:
+                    self.tour_ended[i] = True
+            return last
+    
+    def check_reach(self):
+        reach = True
+        batch_tmp = self.batch
+        self.batch = [None] * self.batch_size
+        for i in range(self.batch_size):
+            if batch_tmp[i] is not None:
+                if batch_tmp[i]['path'][-1] != self.env.world_states[i].viewpoint_id:
+                    self.batch[i] = {
+                        'heading': self.env.world_states[i].heading,
+                        'path': self.shortest_paths[self.env.world_states[i].scan_id][
+                                    self.env.world_states[i].viewpoint_id][batch_tmp[i]['path'][-1]][:-1]
+                    }
+                    reach = False
+                else:
+                    self.batch[i] = {
+                        'heading': self.env.world_states[i].heading,
+                        'path': []
+                    }
+        if not reach:
+            self.extra_obs = self._get_path_obs()
+        self.batch = batch_tmp
+        return reach
 
     def _next_minibatch(self, batch_size=None, **kwargs):
         """
@@ -201,19 +216,23 @@ class R2RBatch(object):
                     self.ix += batch_size
                 self.tour_batch = batch
                 self.tour_batch_probe = np.array([0] * batch_size)
+                self.tour_ended = [False] * self.batch_size
                 self.extra_obs = None
             else:
                 self.tour_batch_probe += 1
-                batch_tmp = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] for i in range(batch_size)]
+                batch_tmp = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] \
+                                 if not self.tour_ended[i] else None for i in range(batch_size)]
                 for i in range(batch_size):
-                    if self.env.world_states[i].viewpoint_id != batch_tmp[i]['path'][0]:
+                    if batch_tmp[i] is not None and self.env.world_states[i].viewpoint_id != batch_tmp[i]['path'][0]:
                         batch_tmp[i] = {
                             'heading': self.env.world_states[i].heading,
-                            'path': self.shortest_paths[self.env.world_states[i].scan_id][self.env.world_states[i].viewpoint_id][batch_tmp[i]['path'][0]]
+                            'path': self.shortest_paths[self.env.world_states[i].scan_id][
+                                        self.env.world_states[i].viewpoint_id][batch_tmp[i]['path'][0]][:-1]
                         }
                 self.batch = batch_tmp
-                self.extra_obs = self.get_path_obs()
-            self.batch = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] for i in range(batch_size)]
+                self.extra_obs = self._get_path_obs()
+            self.batch = [self.data[self.tour_batch[i][self.tour_batch_probe[i]]] \
+                            if not self.tour_ended[i] else None for i in range(batch_size)]
         else:
             batch = self.data[self.ix: self.ix+batch_size]
             if len(batch) < batch_size:
@@ -275,10 +294,13 @@ class R2RBatch(object):
                     teacher_vp = path[cur_idx + 1]
         return teacher_vp
 
-    def get_path_obs(self):
+    def _get_path_obs(self):
         obs = []
         for i, (feature, state) in enumerate(self.env.getStates()):
             item = self.batch[i]
+            if item is None:
+                obs.append(None)
+                continue
             path_feats = []
             angle_feats = []
             path_view_id = round(item['heading'] / ANGLE_INC) % 12 + 12
@@ -309,6 +331,9 @@ class R2RBatch(object):
         obs = []
         for i, (feature, state) in enumerate(self.env.getStates()):
             item = self.batch[i]
+            if item is None:
+                obs.append(None)
+                continue
             base_view_id = state.view_index
 
             if feature is None:
@@ -343,20 +368,28 @@ class R2RBatch(object):
         ''' Load a new minibatch / episodes. '''
         self._next_minibatch(**kwargs)
         
-        scanIds = [item['scan'] for item in self.batch]
-        viewpointIds = [item['path'][0] for item in self.batch]
-        headings = [item['heading'] for item in self.batch]
+        scanIds = [item['scan'] if item is not None else None for item in self.batch]
+        viewpointIds = [item['path'][0] if item is not None else None for item in self.batch]
+        headings = [item['heading'] if item is not None else None for item in self.batch]
         self.env.newEpisodes(scanIds, viewpointIds, headings)
         return self._get_obs(t=0)
 
     def step(self, actions, t=None, traj=None):
         ''' Take action (same interface as makeActions) '''
-        self.env.makeActions(actions)
+        full_actions = np.full(len(self.batch), -1, np.int64)
+        counter = 0
+        idmap = {}
+        for i, b in enumerate(self.batch):
+            if b is not None:
+                full_actions[i] = actions[counter]
+                idmap[counter] = i
+                counter += 1
+        self.env.makeActions(full_actions)
         for i, action in enumerate(actions):
             if action >= 0 and traj is not None:
-                traj[i]['path'].append((self.env.world_states[i].viewpoint_id,
-                                        self.env.world_states[i].heading,
-                                        self.env.world_states[i].elevation))
+                traj[i]['path'].append((self.env.world_states[idmap[i]].viewpoint_id,
+                                        self.env.world_states[idmap[i]].heading,
+                                        self.env.world_states[idmap[i]].elevation))
         return self._get_obs(t=t)
 
 
@@ -428,114 +461,4 @@ class R2RBatch(object):
             'SDTW': np.mean(metrics['SDTW']) * 100,
             'CLS': np.mean(metrics['CLS']) * 100,
         }
-        return avg_metrics, metrics
-
-
-class R2RBackBatch(R2RBatch):
-    def __init__(
-        self, feat_db, instr_data, connectivity_dir,
-        batch_size=64, angle_feat_size=4,
-        seed=0, name=None, sel_data_idxs=None
-    ):
-        self.gt_midstops = {
-            x['instr_id']: x['midstop'] for x in instr_data
-        }
-        super().__init__(
-            feat_db, instr_data, connectivity_dir, batch_size=batch_size,
-            angle_feat_size=angle_feat_size, seed=seed, name=name, sel_data_idxs=sel_data_idxs
-        )
-
-    def _get_obs(self, t=None, shortest_teacher=False):
-        obs = []
-        for i, (feature, state) in enumerate(self.env.getStates()):
-            item = self.batch[i]
-            base_view_id = state.view_index
-
-            if feature is None:
-                feature = np.zeros((36, 2048))
-
-            # Full features
-            candidate = self.make_candidate(feature, state.scan_id, state.viewpoint_id, state.view_index)
-            # [visual_feature, angle_feature] for views
-            feature = np.concatenate((feature, self.angle_feature[base_view_id]), -1)
-
-            obs.append({
-                'instr_id': item['instr_id'],
-                'scan': state.scan_id,
-                'viewpoint': state.viewpoint_id,
-                'viewIndex': state.view_index,
-                'heading': state.heading,
-                'elevation': state.elevation,
-                'feature': feature,
-                'candidate': candidate,
-                'instruction': item['instruction'],
-                'teacher': self._teacher_path_action(state, item['path'], t=t, shortest_teacher=shortest_teacher),
-                'gt_path': item['path'],
-                'path_id': item['path_id']
-            })
-            if 'instr_encoding' in item:
-                obs[-1]['instr_encoding'] = item['instr_encoding']
-            # A2C reward. The negative distance between the state and the final state
-            obs[-1]['distance'] = (
-                self.shortest_distances[state.scan_id][state.viewpoint_id][item['midstop']],
-                self.shortest_distances[state.scan_id][state.viewpoint_id][item['path'][-1]]
-            )
-        return obs
-
-    def _eval_item(self, scan, path, gt_path, midstop, gt_midstop):
-        scores = {}
-
-        shortest_distances = self.shortest_distances[scan]
-
-        assert gt_path[0] == path[0], 'Result trajectories should include the start position'
-
-        scores['nav_error'] = shortest_distances[path[-1]][gt_path[-1]]
-        scores['trajectory_steps'] = len(path) - 1
-        scores['trajectory_lengths'] = np.sum([shortest_distances[a][b] for a, b in zip(path[:-1], path[1:])])
-
-        gt_lengths = np.sum([shortest_distances[a][b] for a, b in zip(gt_path[:-1], gt_path[1:])])
-        
-        success = 0
-        if midstop is not None:
-            if shortest_distances[midstop][gt_midstop] <= ERROR_MARGIN:
-                if shortest_distances[path[-1]][gt_path[-1]] <= ERROR_MARGIN:
-                    success = 1
-
-        scores['success'] = success
-        scores['spl'] = scores['success'] * gt_lengths / max(scores['trajectory_lengths'], gt_lengths, 0.01)
-
-        scores.update(
-            cal_dtw(shortest_distances, path, gt_path, scores['success'], ERROR_MARGIN)
-        )
-        scores['CLS'] = cal_cls(shortest_distances, path, gt_path, ERROR_MARGIN)
-
-        return scores
-
-    def eval_metrics(self, preds):
-        print('eval %d predictions' % (len(preds)))
-
-        metrics = defaultdict(list)
-
-        for item in preds:
-            instr_id = item['instr_id']
-            traj = [x[0] for x in item['trajectory']]
-            scan, gt_traj = self.gt_trajs[instr_id]
-            traj_scores = self._eval_item(
-                scan, traj, gt_traj, item['midstop'], self.gt_midstops[instr_id]
-            )
-            for k, v in traj_scores.items():
-                metrics[k].append(v)
-            metrics['instr_id'].append(instr_id)
-        
-        avg_metrics = {
-            'steps': np.mean(metrics['trajectory_steps']),
-            'lengths': np.mean(metrics['trajectory_lengths']),
-            'nav_error': np.mean(metrics['nav_error']),
-            'sr': np.mean(metrics['success']) * 100,
-            'spl': np.mean(metrics['spl']) * 100,
-            'nDTW': np.mean(metrics['nDTW']) * 100,
-            'SDTW': np.mean(metrics['SDTW']) * 100,
-            'CLS': np.mean(metrics['CLS']) * 100,
-        }
-
         return avg_metrics, metrics

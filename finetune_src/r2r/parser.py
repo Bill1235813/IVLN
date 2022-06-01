@@ -12,6 +12,7 @@ def parse_args():
     parser.add_argument('--sep_hist', action='store_true', default=False, help='use separate tag for prev and curr hist')
     parser.add_argument('--rebuild', action='store_true', default=False,
                         help='rebuild hist after grad update')
+    parser.add_argument('--inflation_weighting', type=float, default=None, help='weight loss more as trajectory length grows')
 
     
     parser.add_argument('--root_dir', type=str, default='../datasets')

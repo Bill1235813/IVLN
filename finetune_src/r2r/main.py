@@ -15,11 +15,8 @@ from utils.distributed import all_gather, merge_dist_results
 from models.vlnbert_init import get_tokenizer
 
 from r2r.agent_cmt import Seq2SeqCMTAgent
-# from r2r.agent_cmt_mmmtvln import Seq2SeqMMMTVLNAgent
-
-from r2r.agent_r2rback import Seq2SeqBackAgent
 from r2r.data_utils import ImageFeaturesDB, construct_instrs
-from r2r.env import R2RBatch, R2RBackBatch
+from r2r.env import R2RBatch
 from r2r.parser import parse_args
 
 
@@ -29,11 +26,6 @@ def build_dataset(args, rank=0, is_test=False):
 
     feat_db = ImageFeaturesDB(args.img_ft_file, args.image_feat_size)
 
-    if args.dataset == 'r2r_back':
-        dataset_class = R2RBackBatch
-    else:
-        dataset_class = R2RBatch
-
     # because we don't use distributed sampler here
     # in order to make different processes deal with different training examples
     # we need to shuffle the data with different seed in each processes
@@ -41,20 +33,20 @@ def build_dataset(args, rank=0, is_test=False):
         args.anno_dir, args.dataset, ['train'], tokenizer=tok, 
         max_instr_len=args.max_instr_len, fast_epoch=args.fast_epoch
     )
-    train_env = dataset_class(
+    train_env = R2RBatch(
         feat_db, train_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
         angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
-        sel_data_idxs=None, name='train', iterative=args.iterative
+        name='train', iterative=args.iterative
     )
     if args.aug is not None:
         aug_instr_data = construct_instrs(
             args.anno_dir, args.dataset, [args.aug], tokenizer=tok, 
             max_instr_len=args.max_instr_len, fast_epoch=args.fast_epoch
         )
-        aug_env = dataset_class(
+        aug_env = R2RBatch(
             feat_db, aug_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
-            sel_data_idxs=None, name='aug', iterative=args.iterative
+            name='aug', iterative=args.iterative
         )
     else:
         aug_env = None
@@ -77,10 +69,10 @@ def build_dataset(args, rank=0, is_test=False):
             args.anno_dir, args.dataset, [split], tokenizer=tok, 
             max_instr_len=args.max_instr_len, fast_epoch=args.fast_epoch
         )
-        val_env = dataset_class(
+        val_env = R2RBatch(
             feat_db, val_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
-            sel_data_idxs=None if args.world_size < 2 else (rank, args.world_size), name=split, iterative=args.iterative
+            name=split, iterative=args.iterative
         )
         val_envs[split] = val_env
 
@@ -97,11 +89,7 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
         record_file = os.path.join(args.log_dir, 'train.txt')
         write_to_record_file(str(args) + '\n\n', record_file)
 
-    if args.dataset == 'r2r_back':
-        agent_class = Seq2SeqBackAgent
-    else:
-        agent_class = Seq2SeqCMTAgent
-    listner = agent_class(args, train_env, rank=rank)
+    listner = Seq2SeqCMTAgent(args, train_env, rank=rank)
 
     # resume file
     start_iter = 0
@@ -137,10 +125,7 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
             '\nListener training starts, start iteration: %s' % str(start_iter), record_file
         )
 
-    if args.dataset == 'r4r':
-        best_val = {'val_unseen_sampled': {"spl": 0., "sr": 0., "t-spl": 0., "t-sr": 0., "state":""}}
-    else:
-        best_val = {'val_unseen': {"spl": 0., "sr": 0., "t-spl": 0., "t-sr": 0., "state":""}}
+    best_val = {'val_unseen': {"spl": 0., "sr": 0., "t-spl": 0., "t-sr": 0., "state":""}}
     
     for idx in range(start_iter, start_iter+args.iters, args.log_every):
         listner.logs = defaultdict(list)
@@ -244,12 +229,14 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
                         if sr + spl >= best_val[env_name]['t-spl'] + best_val[env_name]['t-sr']:
                             best_val[env_name]['t-spl'] = spl
                             best_val[env_name]['t-sr'] = sr
+                            best_val[env_name]['state'] = 'Iter %d %s' % (iter, loss_str)
+                            listner.save(iter, os.path.join(args.ckpt_dir, "best_%s" % (env_name)))
                     else:
                         if score_summary['spl'] + score_summary['sr'] >= best_val[env_name]['spl'] + best_val[env_name]['sr']:
                             best_val[env_name]['spl'] = score_summary['spl']
                             best_val[env_name]['sr'] = score_summary['sr']
-                    best_val[env_name]['state'] = 'Iter %d %s' % (iter, loss_str)
-                    listner.save(iter, os.path.join(args.ckpt_dir, "best_%s" % (env_name)))
+                            best_val[env_name]['state'] = 'Iter %d %s' % (iter, loss_str)
+                            listner.save(iter, os.path.join(args.ckpt_dir, "best_%s" % (env_name)))
                 
         
         if default_gpu:
@@ -267,11 +254,7 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
 def valid(args, train_env, val_envs, rank=-1):
     default_gpu = is_default_gpu(args)
 
-    if args.dataset == 'r2r_back':
-        agent_class = Seq2SeqBackAgent
-    else:
-        agent_class = Seq2SeqCMTAgent
-    agent = agent_class(args, train_env, rank=rank)
+    agent = Seq2SeqCMTAgent(args, train_env, rank=rank)
 
     if args.resume_file is not None:
         print("Loaded the listener model at iter %d from %s" % (agent.load(args.resume_file), args.resume_file))
@@ -305,45 +288,6 @@ def valid(args, train_env, val_envs, rank=-1):
                 # process tour
                 all_tours = env.tour_data
                 all_tour_length = sum([len(tour) for tour in all_tours])
-
-                # # tour episodic metrics
-                # all_epi_metrics = {
-                #     'trajectory_steps': [],
-                #     'trajectory_lengths': [],
-                #     'nav_error': [],
-                #     'oracle_error': [],
-                #     'success': [],
-                #     'oracle_success': [],
-                #     'spl':[],
-                #     'nDTW':[],
-                #     'SDTW':[],
-                #     'CLS':[],
-                # }
-                # all_tour_ids = []
-                # for tour in all_tours:
-                #     all_tour_ids += tour
-                # for count, id in enumerate(all_metrics['instr_id']):
-                #     if id in all_tour_ids:
-                #         for name in all_epi_metrics:
-                #             all_epi_metrics[name].append(all_metrics[name][count])
-                # avg_metrics = {
-                #     'steps': np.mean(all_epi_metrics['trajectory_steps']),
-                #     'lengths': np.mean(all_epi_metrics['trajectory_lengths']),
-                #     'nav_error': np.mean(all_epi_metrics['nav_error']),
-                #     'oracle_error': np.mean(all_epi_metrics['oracle_error']),
-                #     'sr': np.mean(all_epi_metrics['success']) * 100,
-                #     'oracle_sr': np.mean(all_epi_metrics['oracle_success']) * 100,
-                #     'spl': np.mean(all_epi_metrics['spl']) * 100,
-                #     'nDTW': np.mean(all_epi_metrics['nDTW']) * 100,
-                #     'SDTW': np.mean(all_epi_metrics['SDTW']) * 100,
-                #     'CLS': np.mean(all_epi_metrics['CLS']) * 100,
-                # }
-                # epi_str = ''
-                # for metric, val in avg_metrics.items():
-                #     epi_str += ', %s: %.2f' % (metric, val)
-                # print(epi_str)
-                # print(set(all_metrics['instr_id']) - set(all_tour_ids))
-                
                 
                 # transform to tour metrics
                 all_metric_dict = {}

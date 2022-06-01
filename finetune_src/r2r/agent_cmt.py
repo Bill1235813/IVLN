@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import numpy as np
+import copy
 import random
 import math
 import time
@@ -56,7 +57,7 @@ class Seq2SeqCMTAgent(BaseAgent):
             self.critic = DDP(self.critic, device_ids=[self.rank], find_unused_parameters=True)
 
         self.models = (self.vln_bert, self.critic)
-        self.device = torch.device('cuda:%d'%self.rank) #TODO 
+        self.device = torch.device('cuda:%d'%self.rank) #TODO
 
         # Optimizers
         if self.args.optim == 'rms':
@@ -85,8 +86,10 @@ class Seq2SeqCMTAgent(BaseAgent):
         self.logs = defaultdict(list)
         
         self.max_history = 50
-        self.history = None
-        self.history_raw = None
+        self.tour_prev_ended = [False] * self.env.batch_size
+        self.history = None         # adaptive batch size
+        self.history_raw = None        # full batch size
+        self.history_raw_length = None        # full batch size
 
     def _build_model(self):
         self.vln_bert = VLNBertCMT(self.args).cuda()
@@ -174,17 +177,15 @@ class Seq2SeqCMTAgent(BaseAgent):
         cand_nav_types = torch.from_numpy(cand_nav_types).cuda()
         return cand_img_feats, cand_ang_feats, cand_nav_types, cand_lens
 
-    def _future_variable(self, obs, t, stride=1):
+    def _future_variable(self, obs, t):
         fut_img_feats = np.zeros((len(obs), self.args.image_feat_size), np.float32)
         fut_ang_feats = np.zeros((len(obs), self.args.angle_feat_size), np.float32)
+        episode_not_ended = np.zeros((len(obs)), np.int64)
         for i, ob in enumerate(obs):
-            if t * stride < len(ob['gt_path_feats']):
+            if t < len(ob['gt_path_feats']):
                 fut_img_feats[i] = ob['gt_path_feats'][t][ob['gt_view_idxs'][t], :self.args.image_feat_size]
-                fut_ang_feats[i] = [t]
-            elif (t - 1) * stride + 1 < len(ob['gt_path_feats']):
-                fut_img_feats[i] = ob['gt_path_feats'][-1][ob['gt_view_idxs'][-1], :self.args.image_feat_size]
-                fut_ang_feats[i] = ob['gt_angle_feats'][-1]
-    
+                fut_ang_feats[i] = ob['gt_angle_feats'][t]
+                episode_not_ended[i] = 1
         fut_img_feats = torch.from_numpy(fut_img_feats).cuda()
         fut_ang_feats = torch.from_numpy(fut_ang_feats).cuda()
     
@@ -192,22 +193,19 @@ class Seq2SeqCMTAgent(BaseAgent):
             fut_pano_img_feats = np.zeros((len(obs), self.args.views, self.args.image_feat_size), np.float32)
             fut_pano_ang_feats = np.zeros((len(obs), self.args.views, self.args.angle_feat_size), np.float32)
             for i, ob in enumerate(obs):
-                if t * stride < len(ob['gt_path_feats']):
+                if t < len(ob['gt_path_feats']):
                     fut_pano_img_feats[i] = ob['gt_path_feats'][t][:, :self.args.image_feat_size]
                     fut_pano_ang_feats[i] = ob['gt_path_feats'][t][:, self.args.image_feat_size:]
-                elif (t - 1) * stride + 1 < len(ob['gt_path_feats']):
-                    fut_pano_img_feats[i] = ob['gt_path_feats'][-1][:, :self.args.image_feat_size]
-                    fut_pano_ang_feats[i] = ob['gt_path_feats'][-1][:, self.args.image_feat_size:]
             fut_pano_img_feats = torch.from_numpy(fut_pano_img_feats).cuda()
             fut_pano_ang_feats = torch.from_numpy(fut_pano_ang_feats).cuda()
         else:
             fut_pano_img_feats, fut_pano_ang_feats = None, None
     
-        return fut_img_feats, fut_ang_feats, fut_pano_img_feats, fut_pano_ang_feats
+        return (fut_img_feats, fut_ang_feats, fut_pano_img_feats, fut_pano_ang_feats), episode_not_ended
     
     def _history_variable(self, obs):
         hist_img_feats = np.zeros((len(obs), self.args.image_feat_size), np.float32)
-        for i, ob in enumerate(obs):  
+        for i, ob in enumerate(obs):
             hist_img_feats[i] = ob['feature'][ob['viewIndex'], :self.args.image_feat_size]
         hist_img_feats = torch.from_numpy(hist_img_feats).cuda()
 
@@ -280,7 +278,56 @@ class Seq2SeqCMTAgent(BaseAgent):
     #             if traj is not None:
     #                 traj[i]['path'].append((state.location.viewpointId, state.heading, state.elevation))
 
-    def rollout(self, train_ml=None, train_rl=True, reset=True, history=False, sep_hist=False, rebuild=False):
+    def _edit_history_length(self):
+        for i_batch, hist in enumerate(self.history):
+            l_hist = len(hist)
+            if l_hist > self.max_history:
+                delta = l_hist - self.max_history
+                self.history[i_batch] = hist[:1] + hist[delta + 1:]
+                for k in range(5):
+                    self.history_raw[i_batch][k] = self.history_raw[i_batch][k][delta:]
+                self.history_raw_length[i_batch] -= delta
+
+    def _pad_hist_embeds(self):
+        max_length = max([len(hist) for hist in self.history])
+        hist_embeds = []
+        for hist in self.history:
+            hist_embeds.append(F.pad(input=torch.stack(hist), pad=(0, 0, 0, max_length-len(hist)), value=0))
+        return torch.stack(hist_embeds)
+        
+    def _oracle_phrase(self):
+        if self.env.extra_obs is not None:
+            self.env.extra_obs = [ob for ob in self.env.extra_obs if ob is not None]
+            future_lens = []
+            for ob in self.env.extra_obs:
+                if len(ob['gt_path_feats']) > self.vln_bert.vis_config.max_action_steps:
+                    ob['gt_path_feats'] = ob['gt_path_feats'][-self.vln_bert.vis_config.max_action_steps:]
+                    ob['gt_angle_feats'] = ob['gt_angle_feats'][-self.vln_bert.vis_config.max_action_steps:]
+                    ob['gt_view_idxs'] = ob['gt_view_idxs'][-self.vln_bert.vis_config.max_action_steps:]
+                future_lens.append(len(ob['gt_path_feats']))
+            for t in range(max(future_lens)):
+                feats, episode_not_ended = self._future_variable(self.env.extra_obs, t)
+                t_hist_inputs = {
+                    'mode': 'history',
+                    'hist_img_feats': feats[0],
+                    'hist_ang_feats': feats[1],
+                    'hist_pano_img_feats': feats[2],
+                    'hist_pano_ang_feats': feats[3],
+                    'ob_step': [t],
+                }
+                t_hist_embeds = self.vln_bert(**t_hist_inputs)
+
+                self.history_raw_length += episode_not_ended
+                for i_batch, hist_embed in enumerate(t_hist_embeds):
+                    if episode_not_ended[i_batch]:
+                        self.history[i_batch].append(hist_embed)
+                        for k in range(4):
+                            self.history_raw[i_batch][k].append(feats[k][i_batch])
+                        self.history_raw[i_batch][4].append(t)
+            self._edit_history_length()
+        
+        
+    def rollout(self, train_ml=None, train_rl=True, reset=True, extended_history=False, sep_hist=False, rebuild=False):
         """
         :param train_ml:    The weight to train with maximum likelihood
         :param train_rl:    whether use RL in training
@@ -295,54 +342,41 @@ class Seq2SeqCMTAgent(BaseAgent):
             obs = self.env.reset()
         else:
             obs = self.env._get_obs(t=0)
-        batch_size = len(obs)
+        not_ended_obs = [ob for ob in obs if ob is not None]
+        tour_prev_not_ended = ~np.array(self.tour_prev_ended)
+        tour_not_ended = ~(np.array(self.env.tour_ended)[tour_prev_not_ended])
+        batch_size = tour_not_ended.sum()
 
         # rebuild history after grad update
-        if rebuild and train_ml:
-            if self.history is not None:
-                self.history = [self.vln_bert('history', ob_step=-1).expand(batch_size, -1)]
-                for t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats, t in self.history_raw:
-                    t_fut_inputs = {
+        if extended_history and self.history is not None:
+            self.history_raw = [hist for i, hist in enumerate(self.history_raw) if tour_not_ended[i]]
+            self.history_raw_length = self.history_raw_length[tour_not_ended]
+            if rebuild:
+                if sep_hist:
+                    self.history = [[h_embed] for h_embed in self.vln_bert('history', ob_step=[-1]).expand(batch_size, -1)]
+                else:
+                    self.history = [[h_embed] for h_embed in self.vln_bert('history').expand(batch_size, -1)]
+                for i_batch, hist_seq in enumerate(self.history_raw):
+                    img_feats, ang_feats, pano_img_feats, pano_ang_feats, ob_step = hist_seq
+                    hist_inputs = {
                         'mode': 'history',
-                        'hist_img_feats': t_img_feats,
-                        'hist_ang_feats': t_ang_feats,
-                        'hist_pano_img_feats': t_pano_img_feats,
-                        'hist_pano_ang_feats': t_pano_ang_feats,
-                        'ob_step': t,
+                        'hist_img_feats': torch.stack(img_feats),
+                        'hist_ang_feats': torch.stack(ang_feats),
+                        'hist_pano_img_feats': torch.stack(pano_img_feats),
+                        'hist_pano_ang_feats': torch.stack(pano_ang_feats),
+                        'ob_step': ob_step,
                     }
-                    t_fut_embeds = self.vln_bert(**t_fut_inputs)
-                    self.history.append(t_fut_embeds)
+                    hist_embeds = self.vln_bert(**hist_inputs)
+                    self.history[i_batch] += [h_embed for h_embed in hist_embeds]
+            else:
+                self.history = [hist for i, hist in enumerate(self.history) if tour_not_ended[i]]
             
-        # oracle phase history
-        if self.env.extra_obs is not None:
-            assert self.history is not None
-            if train_ml is not None:
-                assert self.history_raw is not None
-            future_lens = []
-            for ob in self.env.extra_obs:
-                if len(ob['gt_path_feats']) > self.vln_bert.vis_config.max_action_steps:
-                    ob['gt_path_feats'] = ob['gt_path_feats'][-self.vln_bert.vis_config.max_action_steps:]
-                    ob['gt_angle_feats'] = ob['gt_angle_feats'][-self.vln_bert.vis_config.max_action_steps:]
-                    ob['gt_view_idxs'] = ob['gt_view_idxs'][-self.vln_bert.vis_config.max_action_steps:]
-                future_lens.append(len(ob['gt_path_feats']))
-            for t in range(max(future_lens) - 1):
-                t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats = self._future_variable(self.env.extra_obs, t)
-                t_fut_inputs = {
-                    'mode': 'history',
-                    'hist_img_feats': t_img_feats,
-                    'hist_ang_feats': t_ang_feats,
-                    'hist_pano_img_feats': t_pano_img_feats,
-                    'hist_pano_ang_feats': t_pano_ang_feats,
-                    'ob_step': t,
-                }
-                t_fut_embeds = self.vln_bert(**t_fut_inputs)
-                self.history.append(t_fut_embeds)
-                if train_ml is not None:
-                    self.history_raw.append((t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats, t))
-        
-
+        # oracle phase-1
+        if self.env.iterative:
+            self._oracle_phrase()
+    
         # Language input
-        txt_ids, txt_masks, txt_lens = self._language_variable(obs)
+        txt_ids, txt_masks, txt_lens = self._language_variable(not_ended_obs)
 
         ''' Language BERT '''
         language_inputs = {
@@ -358,15 +392,15 @@ class Seq2SeqCMTAgent(BaseAgent):
             'gt_path': ob['gt_path'],
             'gt_length': ob['distance'],
             'path': [(ob['viewpoint'], ob['heading'], ob['elevation'])],
-        } for ob in obs]
+        } for ob in not_ended_obs]
 
-        # Init the reward shaping
-        last_dist = np.zeros(batch_size, np.float32)
-        last_ndtw = np.zeros(batch_size, np.float32)
-        for i, ob in enumerate(obs):   # The init distance from the view point to the target
-            last_dist[i] = ob['distance']
-            path_act = [vp[0] for vp in traj[i]['path']]
-            last_ndtw[i] = cal_dtw(self.env.shortest_distances[ob['scan']], path_act, ob['gt_path'])['nDTW']
+        # # Init the reward shaping
+        # last_dist = np.zeros(batch_size, np.float32)
+        # last_ndtw = np.zeros(batch_size, np.float32)
+        # for i, ob in enumerate(not_ended_obs):   # The init distance from the view point to the target
+        #     last_dist[i] = ob['distance']
+        #     path_act = [vp[0] for vp in traj[i]['path']]
+        #     last_ndtw[i] = cal_dtw(self.env.shortest_distances[ob['scan']], path_act, ob['gt_path'])['nDTW']
 
         # Initialization the tracking state
         ended = np.array([False] * batch_size)
@@ -378,37 +412,42 @@ class Seq2SeqCMTAgent(BaseAgent):
         masks = []
         entropys = []
         ml_loss = 0.
+        lamd = 1.0
 
         # for backtrack
         visited = [set() for _ in range(batch_size)]
+        
         # init history
-        if not history or self.history is None:
-            self.history = [self.vln_bert('history').expand(batch_size, -1)]  # global embedding
-            self.history_raw = []
-            hist_lens = [1 for _ in range(batch_size)]
+        if not extended_history or self.history is None:
+            first_ep = True
+            self.history = [[h_embed] for h_embed in self.vln_bert('history').expand(batch_size, -1)]  # global embedding
+            self.history_raw = [[[] for _ in range(5)] for _ in range(batch_size)]
+            self.history_raw_length = np.zeros(batch_size, np.int64)
         else:
+            first_ep = False
             if sep_hist:
-                self.history.append(self.vln_bert('history').expand(batch_size, -1))
-            if len(self.history) > self.max_history:
-                self.history = self.history[:1] + self.history[-(self.max_history - 1):]
-                if train_ml is not None:
-                    self.history_raw = self.history_raw[-(self.max_history - 1):]
-            hist_lens = [len(self.history)] # todo: only for batch size 1
-
+                pivot = self.history_raw_length.copy()
+                current_hist_tag = self.vln_bert('history').expand(batch_size, -1)
+                for i_batch, hist_tag in enumerate(current_hist_tag):
+                    self.history[i_batch].append(hist_tag)
+                self._edit_history_length()
+                
         for t in range(self.args.max_action_len):
             if self.args.ob_type == 'pano':
-                ob_img_feats, ob_ang_feats, ob_nav_types, ob_lens, ob_cand_lens = self._cand_pano_feature_variable(obs)
+                ob_img_feats, ob_ang_feats, ob_nav_types, ob_lens, ob_cand_lens = self._cand_pano_feature_variable(not_ended_obs)
                 ob_masks = length2mask(ob_lens).logical_not()
             elif self.args.ob_type == 'cand':
-                ob_img_feats, ob_ang_feats, ob_nav_types, ob_cand_lens = self._candidate_variable(obs)
+                ob_img_feats, ob_ang_feats, ob_nav_types, ob_cand_lens = self._candidate_variable(not_ended_obs)
                 ob_masks = length2mask(ob_cand_lens).logical_not()
             
             ''' Visual BERT '''
+            hist_lens = list(self.history_raw_length + 2) if sep_hist and not first_ep else list(self.history_raw_length + 1)
+            hist_embeds = self._pad_hist_embeds()
             visual_inputs = {
                 'mode': 'visual',
                 'txt_embeds': txt_embeds,
                 'txt_masks': txt_masks,
-                'hist_embeds': self.history,    # history before t step
+                'hist_embeds': hist_embeds,    # history before t step
                 'hist_lens': hist_lens,
                 'ob_img_feats': ob_img_feats,
                 'ob_ang_feats': ob_ang_feats,
@@ -424,19 +463,19 @@ class Seq2SeqCMTAgent(BaseAgent):
 
             if train_ml is not None:
                 # Supervised training
-                target = self._teacher_action(obs, ended)
-                ml_loss += self.criterion(logit, target)
+                target = self._teacher_action(not_ended_obs, ended)
+                ml_loss += self.criterion(logit, target) * lamd
 
-            # mask logit where the agent backtracks in observation in evaluation
-            if self.args.no_cand_backtrack:
-                bt_masks = torch.zeros(ob_nav_types.size()).bool()
-                for ob_id, ob in enumerate(obs):
-                    visited[ob_id].add(ob['viewpoint'])
-                    for c_id, c in enumerate(ob['candidate']):
-                        if c['viewpointId'] in visited[ob_id]:
-                            bt_masks[ob_id][c_id] = True
-                bt_masks = bt_masks.cuda()
-                logit.masked_fill_(bt_masks, -float('inf'))
+            # # mask logit where the agent backtracks in observation in evaluation
+            # if self.args.no_cand_backtrack:
+            #     bt_masks = torch.zeros(ob_nav_types.size()).bool()
+            #     for ob_id, ob in enumerate(not_ended_obs):
+            #         visited[ob_id].add(ob['viewpoint'])
+            #         for c_id, c in enumerate(ob['candidate']):
+            #             if c['viewpointId'] in visited[ob_id]:
+            #                 bt_masks[ob_id][c_id] = True
+            #     bt_masks = bt_masks.cuda()
+            #     logit.masked_fill_(bt_masks, -float('inf'))
 
             # Determine next model inputs
             if self.feedback == 'teacher':
@@ -467,76 +506,79 @@ class Seq2SeqCMTAgent(BaseAgent):
             if train_rl or ((not np.logical_or(ended, (cpu_a_t == -1)).all()) and (t != self.args.max_action_len-1)):
                 # DDP error: RuntimeError: Expected to mark a variable ready only once.
                 # It seems that every output from DDP should be used in order to perform correctly
-                hist_img_feats, hist_pano_img_feats, hist_pano_ang_feats = self._history_variable(obs)
-                prev_act_angle = np.zeros((batch_size, self.args.angle_feat_size), np.float32)
+                hist_img_feats, hist_pano_img_feats, hist_pano_ang_feats = self._history_variable(not_ended_obs)
+                prev_act_angle = np.zeros((len(not_ended_obs), self.args.angle_feat_size), np.float32)
                 for i, next_id in enumerate(cpu_a_t):
                     if next_id != -1:
-                        prev_act_angle[i] = obs[i]['candidate'][next_id]['feature'][-self.args.angle_feat_size:]
+                        prev_act_angle[i] = not_ended_obs[i]['candidate'][next_id]['feature'][-self.args.angle_feat_size:]
                 prev_act_angle = torch.from_numpy(prev_act_angle).cuda()
-
                 t_hist_inputs = {
                     'mode': 'history',
                     'hist_img_feats': hist_img_feats,
                     'hist_ang_feats': prev_act_angle,
                     'hist_pano_img_feats': hist_pano_img_feats,
                     'hist_pano_ang_feats': hist_pano_ang_feats,
-                    'ob_step': t,
+                    'ob_step': [t],
                 }
                 t_hist_embeds = self.vln_bert(**t_hist_inputs)
-                self.history.append(t_hist_embeds)
-                if train_ml is not None:
-                    self.history_raw.append((hist_img_feats, prev_act_angle, hist_pano_img_feats, hist_pano_ang_feats, t))
-                if len(self.history) > self.max_history:
-                    self.history = self.history[:1] + self.history[-(self.max_history - 1):]
-                    if train_ml is not None:
-                        self.history_raw = self.history_raw[-(self.max_history - 1):]
-
-                for i, i_ended in enumerate(ended):
+                for i_batch, i_ended in enumerate(ended):
                     if not i_ended:
-                        hist_lens[i] += 1
+                        self.history_raw_length[i_batch] += 1
+                        self.history[i_batch].append(t_hist_embeds[i_batch])
+                        self.history_raw[i_batch][0].append(hist_img_feats[i_batch])
+                        self.history_raw[i_batch][1].append(prev_act_angle[i_batch])
+                        self.history_raw[i_batch][2].append(hist_pano_img_feats[i_batch])
+                        self.history_raw[i_batch][3].append(hist_pano_ang_feats[i_batch])
+                        self.history_raw[i_batch][4].append(t)
+                self._edit_history_length()
 
+                
             # Make action and get the new state
             obs = self.env.step(cpu_a_t, t=t+1, traj=traj)
+            not_ended_obs = [ob for ob in obs if ob is not None]
 
-            if train_rl:
-                # Calculate the mask and reward
-                dist = np.zeros(batch_size, np.float32)
-                ndtw_score = np.zeros(batch_size, np.float32)
-                reward = np.zeros(batch_size, np.float32)
-                mask = np.ones(batch_size, np.float32)
-                for i, ob in enumerate(obs):
-                    dist[i] = ob['distance']
-                    path_act = [vp[0] for vp in traj[i]['path']]
-                    ndtw_score[i] = cal_dtw(self.env.shortest_distances[ob['scan']], path_act, ob['gt_path'])['nDTW']
+            # if train_rl:
+            #     # Calculate the mask and reward
+            #     dist = np.zeros(batch_size, np.float32)
+            #     ndtw_score = np.zeros(batch_size, np.float32)
+            #     reward = np.zeros(batch_size, np.float32)
+            #     mask = np.ones(batch_size, np.float32)
+            #     for i, ob in enumerate(obs):
+            #         dist[i] = ob['distance']
+            #         path_act = [vp[0] for vp in traj[i]['path']]
+            #         ndtw_score[i] = cal_dtw(self.env.shortest_distances[ob['scan']], path_act, ob['gt_path'])['nDTW']
+            #
+            #         if ended[i]:
+            #             reward[i] = 0.0
+            #             mask[i] = 0.0
+            #         else:
+            #             action_idx = cpu_a_t[i]
+            #             # Target reward
+            #             if action_idx == -1:                              # If the action now is end
+            #                 if dist[i] < 3.0:                             # Correct
+            #                     reward[i] = 2.0 + ndtw_score[i] * 2.0
+            #                 else:                                         # Incorrect
+            #                     reward[i] = -2.0
+            #             else:                                             # The action is not end
+            #                 # Path fidelity rewards (distance & nDTW)
+            #                 reward[i] = - (dist[i] - last_dist[i])  # this distance is not normalized
+            #                 ndtw_reward = ndtw_score[i] - last_ndtw[i]
+            #                 if reward[i] > 0.0:                           # Quantification
+            #                     reward[i] = 1.0 + ndtw_reward
+            #                 elif reward[i] < 0.0:
+            #                     reward[i] = -1.0 + ndtw_reward
+            #                 else:
+            #                     raise NameError("The action doesn't change the move")
+            #                 # Miss the target penalty
+            #                 if (last_dist[i] <= 1.0) and (dist[i]-last_dist[i] > 0.0):
+            #                     reward[i] -= (1.0 - last_dist[i]) * 2.0
+            #     rewards.append(reward)
+            #     masks.append(mask)
+            #     last_dist[:] = dist
+            #     last_ndtw[:] = ndtw_score
 
-                    if ended[i]:
-                        reward[i] = 0.0
-                        mask[i] = 0.0
-                    else:
-                        action_idx = cpu_a_t[i]
-                        # Target reward
-                        if action_idx == -1:                              # If the action now is end
-                            if dist[i] < 3.0:                             # Correct
-                                reward[i] = 2.0 + ndtw_score[i] * 2.0
-                            else:                                         # Incorrect
-                                reward[i] = -2.0
-                        else:                                             # The action is not end
-                            # Path fidelity rewards (distance & nDTW)
-                            reward[i] = - (dist[i] - last_dist[i])  # this distance is not normalized
-                            ndtw_reward = ndtw_score[i] - last_ndtw[i]
-                            if reward[i] > 0.0:                           # Quantification
-                                reward[i] = 1.0 + ndtw_reward
-                            elif reward[i] < 0.0:
-                                reward[i] = -1.0 + ndtw_reward
-                            else:
-                                raise NameError("The action doesn't change the move")
-                            # Miss the target penalty
-                            if (last_dist[i] <= 1.0) and (dist[i]-last_dist[i] > 0.0):
-                                reward[i] -= (1.0 - last_dist[i]) * 2.0
-                rewards.append(reward)
-                masks.append(mask)
-                last_dist[:] = dist
-                last_ndtw[:] = ndtw_score
+            if self.args.inflation_weighting is not None:
+                lamd += self.args.inflation_weighting
 
             ended[:] = np.logical_or(ended, (cpu_a_t == -1))
 
@@ -544,73 +586,81 @@ class Seq2SeqCMTAgent(BaseAgent):
             if ended.all():
                 break
 
-        if train_rl:
-            if self.args.ob_type == 'pano':
-                ob_img_feats, ob_ang_feats, ob_nav_types, ob_lens, ob_cand_lens = self._cand_pano_feature_variable(obs)
-                ob_masks = length2mask(ob_lens).logical_not()
-            elif self.args.ob_type == 'cand':
-                ob_img_feats, ob_ang_feats, ob_nav_types, ob_cand_lens = self._candidate_variable(obs)
-                ob_masks = length2mask(ob_cand_lens).logical_not()
+        # if train_rl:
+        #     if self.args.ob_type == 'pano':
+        #         ob_img_feats, ob_ang_feats, ob_nav_types, ob_lens, ob_cand_lens = self._cand_pano_feature_variable(obs)
+        #         ob_masks = length2mask(ob_lens).logical_not()
+        #     elif self.args.ob_type == 'cand':
+        #         ob_img_feats, ob_ang_feats, ob_nav_types, ob_cand_lens = self._candidate_variable(obs)
+        #         ob_masks = length2mask(ob_cand_lens).logical_not()
+        #
+        #     ''' Visual BERT '''
+        #     visual_inputs = {
+        #         'mode': 'visual',
+        #         'txt_embeds': txt_embeds,
+        #         'txt_masks': txt_masks,
+        #         'hist_embeds': self.history,
+        #         'hist_lens': hist_lens,
+        #         'ob_img_feats': ob_img_feats,
+        #         'ob_ang_feats': ob_ang_feats,
+        #         'ob_nav_types': ob_nav_types,
+        #         'ob_masks': ob_masks,
+        #         'return_states': True
+        #     }
+        #     _, last_h_ = self.vln_bert(**visual_inputs)
+        #
+        #     rl_loss = 0.
+        #
+        #     # NOW, A2C!!!
+        #     # Calculate the final discounted reward
+        #     last_value__ = self.critic(last_h_).detach()        # The value esti of the last state, remove the grad for safety
+        #     discount_reward = np.zeros(batch_size, np.float32)  # The inital reward is zero
+        #     for i in range(batch_size):
+        #         if not ended[i]:        # If the action is not ended, use the value function as the last reward
+        #             discount_reward[i] = last_value__[i]
+        #
+        #     length = len(rewards)
+        #     total = 0
+        #     for t in range(length-1, -1, -1):
+        #         discount_reward = discount_reward * self.args.gamma + rewards[t]  # If it ended, the reward will be 0
+        #         mask_ = torch.from_numpy(masks[t]).cuda()
+        #         clip_reward = discount_reward.copy()
+        #         r_ = torch.from_numpy(clip_reward).cuda()
+        #         v_ = self.critic(hidden_states[t])
+        #         a_ = (r_ - v_).detach()
+        #
+        #         t_policy_loss = (-policy_log_probs[t] * a_ * mask_).sum()
+        #         t_critic_loss = (((r_ - v_) ** 2) * mask_).sum() * 0.5 # 1/2 L2 loss
+        #
+        #         rl_loss += t_policy_loss + t_critic_loss
+        #         if self.feedback == 'sample':
+        #             rl_loss += (- self.args.entropy_loss_weight * entropys[t] * mask_).sum()
+        #
+        #         self.logs['critic_loss'].append(t_critic_loss.item())
+        #         self.logs['policy_loss'].append(t_policy_loss.item())
+        #
+        #         total = total + np.sum(masks[t])
+        #     self.logs['total'].append(total)
+        #
+        #     # Normalize the loss function
+        #     if self.args.normalize_loss == 'total':
+        #         rl_loss /= total
+        #     elif self.args.normalize_loss == 'batch':
+        #         rl_loss /= batch_size
+        #     else:
+        #         assert self.args.normalize_loss == 'none'
+        #
+        #     self.loss += rl_loss
+        #     self.logs['RL_loss'].append(rl_loss.item()) # critic loss + policy loss + entropy loss
 
-            ''' Visual BERT '''
-            visual_inputs = {
-                'mode': 'visual',
-                'txt_embeds': txt_embeds,
-                'txt_masks': txt_masks,
-                'hist_embeds': self.history,
-                'hist_lens': hist_lens,
-                'ob_img_feats': ob_img_feats,
-                'ob_ang_feats': ob_ang_feats,
-                'ob_nav_types': ob_nav_types,
-                'ob_masks': ob_masks,
-                'return_states': True
-            }
-            _, last_h_ = self.vln_bert(**visual_inputs)
+        # oracle phase-2
+
+        if sep_hist and not first_ep:
+            for i_batch, p in enumerate(pivot):
+                self.history[i_batch] = self.history[i_batch][:p+1] + self.history[i_batch][p+2:]
+        if self.env.iterative and not self.env.check_reach():
+            self._oracle_phrase()
             
-            rl_loss = 0.
-
-            # NOW, A2C!!!
-            # Calculate the final discounted reward
-            last_value__ = self.critic(last_h_).detach()        # The value esti of the last state, remove the grad for safety
-            discount_reward = np.zeros(batch_size, np.float32)  # The inital reward is zero
-            for i in range(batch_size):
-                if not ended[i]:        # If the action is not ended, use the value function as the last reward
-                    discount_reward[i] = last_value__[i]
-
-            length = len(rewards)
-            total = 0
-            for t in range(length-1, -1, -1):
-                discount_reward = discount_reward * self.args.gamma + rewards[t]  # If it ended, the reward will be 0
-                mask_ = torch.from_numpy(masks[t]).cuda()
-                clip_reward = discount_reward.copy()
-                r_ = torch.from_numpy(clip_reward).cuda()
-                v_ = self.critic(hidden_states[t])
-                a_ = (r_ - v_).detach()
-
-                t_policy_loss = (-policy_log_probs[t] * a_ * mask_).sum()
-                t_critic_loss = (((r_ - v_) ** 2) * mask_).sum() * 0.5 # 1/2 L2 loss
-
-                rl_loss += t_policy_loss + t_critic_loss
-                if self.feedback == 'sample':
-                    rl_loss += (- self.args.entropy_loss_weight * entropys[t] * mask_).sum()
-
-                self.logs['critic_loss'].append(t_critic_loss.item())
-                self.logs['policy_loss'].append(t_policy_loss.item())
-
-                total = total + np.sum(masks[t])
-            self.logs['total'].append(total)
-
-            # Normalize the loss function
-            if self.args.normalize_loss == 'total':
-                rl_loss /= total
-            elif self.args.normalize_loss == 'batch':
-                rl_loss /= batch_size
-            else:
-                assert self.args.normalize_loss == 'none'
-
-            self.loss += rl_loss
-            self.logs['RL_loss'].append(rl_loss.item()) # critic loss + policy loss + entropy loss
-
         if train_ml is not None:
             self.loss += ml_loss * train_ml / batch_size
             self.logs['IL_loss'].append((ml_loss * train_ml / batch_size).item())
@@ -619,37 +669,8 @@ class Seq2SeqCMTAgent(BaseAgent):
             self.losses.append(0.)
         else:
             self.losses.append(self.loss.item() / self.args.max_action_len)  # This argument is useless.
-
-        if not self.env.check_reach():
-            assert self.history is not None
-            future_lens = []
-            for ob in self.env.extra_obs:
-                if len(ob['gt_path_feats']) > self.vln_bert.vis_config.max_action_steps:
-                    ob['gt_path_feats'] = ob['gt_path_feats'][-self.vln_bert.vis_config.max_action_steps:]
-                    ob['gt_angle_feats'] = ob['gt_angle_feats'][-self.vln_bert.vis_config.max_action_steps:]
-                    ob['gt_view_idxs'] = ob['gt_view_idxs'][-self.vln_bert.vis_config.max_action_steps:]
-                future_lens.append(len(ob['gt_path_feats']))
-            for t in range(max(future_lens) - 1):
-                t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats = self._future_variable(self.env.extra_obs, t)
-                t_fut_inputs = {
-                    'mode': 'history',
-                    'hist_img_feats': t_img_feats,
-                    'hist_ang_feats': t_ang_feats,
-                    'hist_pano_img_feats': t_pano_img_feats,
-                    'hist_pano_ang_feats': t_pano_ang_feats,
-                    'ob_step': t,
-                }
-                t_fut_embeds = self.vln_bert(**t_fut_inputs)
-                self.history.append(t_fut_embeds)
-                if train_ml is not None:
-                    self.history_raw.append((t_img_feats, t_ang_feats, t_pano_img_feats, t_pano_ang_feats, t))
-            if len(self.history) > self.max_history:
-                self.history = self.history[:1] + self.history[-(self.max_history - 1):]
-                if train_ml is not None:
-                    self.history_raw = self.history_raw[-(self.max_history - 1):]
-        if sep_hist:
-            self.history[0] = self.vln_bert('history', ob_step=-1).expand(batch_size, -1)
-            
+        
+        self.tour_prev_ended = copy.deepcopy(self.env.tour_ended)
         return traj
 
     def test(self, use_dropout=False, feedback='argmax', allow_cheat=False, iters=None):
@@ -661,7 +682,7 @@ class Seq2SeqCMTAgent(BaseAgent):
         else:
             self.vln_bert.eval()
             self.critic.eval()
-        super().test(iters=iters, history=self.args.extended_history, sep_hist=self.args.sep_hist)
+        super().test(iters=iters, extended_history=self.args.extended_history, sep_hist=self.args.sep_hist)
 
     def zero_grad(self):
         self.loss = 0.
@@ -698,8 +719,10 @@ class Seq2SeqCMTAgent(BaseAgent):
         self.critic.train()
 
         self.losses = []
+        self.tour_prev_ended = [False] * self.env.batch_size
         self.history = None
         self.history_raw = None
+        self.history_raw_length = None
         for iter in range(1, n_iters + 1):
 
             self.vln_bert_optimizer.zero_grad()
@@ -711,13 +734,13 @@ class Seq2SeqCMTAgent(BaseAgent):
                     if feedback == 'teacher':
                         self.feedback = 'teacher'
                         self.rollout(train_ml=self.args.teacher_weight, train_rl=False,
-                                     history=self.args.extended_history, sep_hist=self.args.sep_hist,
+                                     extended_history=self.args.extended_history, sep_hist=self.args.sep_hist,
                                      rebuild=self.args.rebuild, **kwargs)
                     elif feedback == 'sample':  # agents in IL and RL separately
                         if self.args.ml_weight != 0:
                             self.feedback = 'teacher'
                             self.rollout(train_ml=self.args.ml_weight, train_rl=False,
-                                         history=self.args.extended_history, sep_hist=self.args.sep_hist,
+                                         extended_history=self.args.extended_history, sep_hist=self.args.sep_hist,
                                          rebuild=self.args.rebuild, **kwargs)
                         self.feedback = 'sample'
                         self.rollout(train_ml=None, train_rl=True, **kwargs)
@@ -725,8 +748,10 @@ class Seq2SeqCMTAgent(BaseAgent):
                         assert False
                     self.loss.backward()
                     if self.env.check_last():
+                        self.tour_prev_ended = [False] * self.env.batch_size
                         self.history = None
                         self.history_raw = None
+                        self.history_raw_length = None
                         break
             else:
                 self.loss = 0

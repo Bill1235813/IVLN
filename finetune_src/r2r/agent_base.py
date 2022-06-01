@@ -29,8 +29,10 @@ class BaseAgent(object):
         # We rely on env showing the entire batch before repeating anything
         looped = False
         self.loss = 0
+        self.tour_prev_ended = [False] * self.env.batch_size
         self.history = None
         self.history_raw = None
+        self.history_raw_length = None
         if iters is not None:
             # For each time, it will run_r2r_il.sh the first 'iters' iterations. (It was shuffled before)
             for i in range(iters):
@@ -38,7 +40,10 @@ class BaseAgent(object):
                     self.loss = 0
                     self.results[traj['instr_id']] = traj
                 if self.env.check_last():
+                    self.tour_prev_ended = [False] * self.env.batch_size
                     self.history = None
+                    self.history_raw = None
+                    self.history_raw_length = None
         else:   # Do a full round
             while True:
                 for traj in self.rollout(**kwargs):
@@ -48,8 +53,11 @@ class BaseAgent(object):
                         self.loss = 0
                         self.results[traj['instr_id']] = traj
                 if self.env.check_last():
+                    self.tour_prev_ended = [False] * self.env.batch_size
                     self.history = None
-                if looped:
-                    break
+                    self.history_raw = None
+                    self.history_raw_length = None
+                    if looped:
+                        break
 
 
