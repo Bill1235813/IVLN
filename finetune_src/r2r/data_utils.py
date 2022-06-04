@@ -53,7 +53,7 @@ def load_instr_datasets(anno_dir, dataset, splits):
         data += new_data
     return data
 
-def construct_instrs(anno_dir, dataset, splits, tokenizer=None, max_instr_len=512, fast_epoch=False):
+def construct_instrs(anno_dir, dataset, splits, tokenizer=None, max_instr_len=512):
     data = []
     for i, item in enumerate(load_instr_datasets(anno_dir, dataset, splits)):
         if dataset == 'rxr':
@@ -80,8 +80,6 @@ def construct_instrs(anno_dir, dataset, splits, tokenizer=None, max_instr_len=51
                 # new_item['instr_encoding'] = tokenizer.convert_tokens_to_ids(instr_tokens)
                           
                 data.append(new_item)
-        if fast_epoch and i>2:
-            break
     return data
 
 

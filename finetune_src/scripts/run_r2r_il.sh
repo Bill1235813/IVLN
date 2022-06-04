@@ -71,6 +71,6 @@ CUDA_VISIBLE_DEVICES=0 python r2r/main.py $flag \
 
 ## inference
 ## vitbase.e2e resume_file: ../datasets/R2R/trained_models/vitbase-finetune-e2e/ckpts/best_val_unseen
-#CUDA_VISIBLE_DEVICES=1 python r2r/main.py $flag \
-#      --resume_file ../saved_models/R2R/vitbase-finetune-il-b8/ckpts/best_val_unseen \
-#      --test --submit
+CUDA_VISIBLE_DEVICES=0 python r2r/main.py $flag \
+      --resume_file ../saved_models/R2R/vitbase-finetune-il-b8/ckpts/best_val_unseen \
+      --test

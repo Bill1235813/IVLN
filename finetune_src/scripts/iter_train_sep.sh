@@ -74,7 +74,6 @@ flag="--root_dir ../datasets
 export PYTHONPATH=../:$PYTHONPATH
 ## train #0000 000
 ## vitbase.e2e bert_ckpt_file ../datasets/R2R/trained_models/vitbase-6tasks-pretrain-e2e/model_step_22000.pt
-# --eval_first
 CUDA_VISIBLE_DEVICES=0 python r2r/main.py $flag  \
      --aug ../datasets/R2R/annotations/prevalent_aug_train_enc.json \
      --bert_ckpt_file ../datasets/R2R/trained_models/vitbase-6tasks-pretrain-e2e/model_step_22000.pt \
@@ -82,7 +81,7 @@ CUDA_VISIBLE_DEVICES=0 python r2r/main.py $flag  \
 
 # inference
 # vitbase.e2e resume_file: ../datasets/R2R/trained_models/vitbase-finetune-e2e/ckpts/best_val_unseen
-# CUDA_VISIBLE_DEVICES=0 python -m pdb r2r/main.py $flag \
-#       --resume_file ../saved_models/R2R/vitbase-finetune-e2e/ckpts/best_val_unseen \
-#       --test --iterative
-#       --submit
+ CUDA_VISIBLE_DEVICES=0 python r2r/main.py $flag \
+       --resume_file ../saved_models/R2R/vitbase-finetune-iterative-il-hist-sep-b8/ckpts/best_val_unseen \
+       --test --iterative
+

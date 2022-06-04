@@ -18,8 +18,7 @@ from r2r.agent_cmt import Seq2SeqCMTAgent
 from r2r.data_utils import ImageFeaturesDB, construct_instrs
 from r2r.env import R2RBatch
 from r2r.parser import parse_args
-
-
+from r2r.eval_utils import compute_tour_ndtw
 
 def build_dataset(args, rank=0, is_test=False):
     tok = get_tokenizer(args)
@@ -31,7 +30,7 @@ def build_dataset(args, rank=0, is_test=False):
     # we need to shuffle the data with different seed in each processes
     train_instr_data = construct_instrs(
         args.anno_dir, args.dataset, ['train'], tokenizer=tok, 
-        max_instr_len=args.max_instr_len, fast_epoch=args.fast_epoch
+        max_instr_len=args.max_instr_len,
     )
     train_env = R2RBatch(
         feat_db, train_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
@@ -41,7 +40,7 @@ def build_dataset(args, rank=0, is_test=False):
     if args.aug is not None:
         aug_instr_data = construct_instrs(
             args.anno_dir, args.dataset, [args.aug], tokenizer=tok, 
-            max_instr_len=args.max_instr_len, fast_epoch=args.fast_epoch
+            max_instr_len=args.max_instr_len,
         )
         aug_env = R2RBatch(
             feat_db, aug_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
@@ -67,7 +66,7 @@ def build_dataset(args, rank=0, is_test=False):
     for split in val_env_names:
         val_instr_data = construct_instrs(
             args.anno_dir, args.dataset, [split], tokenizer=tok, 
-            max_instr_len=args.max_instr_len, fast_epoch=args.fast_epoch
+            max_instr_len=args.max_instr_len,
         )
         val_env = R2RBatch(
             feat_db, val_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
@@ -177,6 +176,8 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
         # Run validation
         loss_str = "iter {}".format(iter)
         for env_name, env in val_envs.items():
+            def dist_func(x, y):
+                return env.hash_distance_map[x[0] * 100000 + y[0]]
             listner.env = env
 
             # Get validation distance from goal under test evaluation conditions
@@ -208,17 +209,25 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1):
                     weight = len(tour) / all_tour_length
                     inner_sr_list, inner_spl_list, inner_ndtw_list = [], [], []
                     inner_weight_list = []
-                    for instr_id in tour:
+                    edited_pred_path = []
+                    edited_gt_path = []
+                    for i, instr_id in enumerate(tour):
                         metrics = all_metrics[instr_id]
+                        scan = metrics['scan']
+                        edited_pred_path += [{"position": env.hash_node_map[scan + "_" + node[0]], "episode_id": i}
+                                             for node in metrics['agent_path']]
+                        edited_gt_path += [{"position": env.hash_node_map[scan + "_" + node], "episode_id": i}
+                                           for node in metrics['gt_path']]
                         inner_weight_list.append(
                             max(metrics['gt_length'], metrics['trajectory_lengths']) / metrics['gt_length'])
                         inner_sr_list.append(metrics['success'])
                         inner_spl_list.append(metrics['spl'])
-                        inner_ndtw_list.append(metrics['nDTW'])
+                        # inner_ndtw_list.append(metrics['nDTW'])
                     inner_weight_list = np.array(inner_weight_list) / sum(inner_weight_list)
                     sr += weight * (inner_weight_list * np.array(inner_sr_list)).sum()
                     spl += weight * (inner_weight_list * np.array(inner_spl_list)).sum()
-                    ndtw += weight * (inner_weight_list * np.array(inner_ndtw_list)).sum()
+                    tour_ndtw = compute_tour_ndtw(edited_pred_path, edited_gt_path, dist_func)
+                    ndtw += weight * tour_ndtw
                 loss_str += ', %s: %.2f' % ('t-sr', sr * 100)
                 loss_str += ', %s: %.2f' % ('t-spl', spl * 100)
                 loss_str += ', %s: %.2f' % ('t-nDTW', ndtw * 100)
@@ -266,6 +275,8 @@ def valid(args, train_env, val_envs, rank=-1):
         write_to_record_file(str(args) + '\n\n', record_file)
 
     for env_name, env in val_envs.items():
+        def dist_func(x, y):
+            return env.hash_distance_map[x[0] * 100000 + y[0]]
         # if os.path.exists(os.path.join(args.pred_dir, "submit_%s.json" % env_name)):
         #     continue
         agent.logs = defaultdict(list)
@@ -304,16 +315,24 @@ def valid(args, train_env, val_envs, rank=-1):
                     weight = len(tour) / all_tour_length
                     inner_sr_list, inner_spl_list, inner_ndtw_list = [], [], []
                     inner_weight_list = []
-                    for instr_id in tour:
+                    edited_pred_path = []
+                    edited_gt_path = []
+                    for i, instr_id in enumerate(tour):
                         metrics = all_metrics[instr_id]
-                        inner_weight_list.append(max(metrics['gt_length'],metrics['trajectory_lengths']) / metrics['gt_length'])
+                        scan = metrics['scan']
+                        edited_pred_path += [{"position": env.hash_node_map[scan + "_" + node[0]], "episode_id": i}
+                            for node in metrics['agent_path']]
+                        edited_gt_path += [{"position": env.hash_node_map[scan + "_" + node], "episode_id": i}
+                            for node in metrics['gt_path']]
+                        inner_weight_list.append(max(metrics['gt_length'], metrics['trajectory_lengths']) / metrics['gt_length'])
                         inner_sr_list.append(metrics['success'])
                         inner_spl_list.append(metrics['spl'])
-                        inner_ndtw_list.append(metrics['nDTW'])
+                        # inner_ndtw_list.append(metrics['nDTW'])
                     inner_weight_list = np.array(inner_weight_list) / sum(inner_weight_list)
                     sr += weight * (inner_weight_list * np.array(inner_sr_list)).sum()
                     spl += weight * (inner_weight_list * np.array(inner_spl_list)).sum()
-                    ndtw += weight * (inner_weight_list * np.array(inner_ndtw_list)).sum()
+                    tour_ndtw = compute_tour_ndtw(edited_pred_path, edited_gt_path, dist_func)
+                    ndtw += weight * tour_ndtw
                 loss_str += ', %s: %.2f' % ('t-sr', sr * 100)
                 loss_str += ', %s: %.2f' % ('t-spl', spl * 100)
                 loss_str += ', %s: %.2f' % ('t-nDTW', ndtw * 100)
@@ -347,3 +366,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+

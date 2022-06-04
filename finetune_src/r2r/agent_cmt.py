@@ -79,7 +79,7 @@ class Seq2SeqCMTAgent(BaseAgent):
 
         # Evaluations
         self.losses = []
-        self.criterion = nn.CrossEntropyLoss(ignore_index=self.args.ignoreid, size_average=False)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.args.ignoreid, reduction="none")
 
         # Logs
         sys.stdout.flush()
@@ -389,6 +389,7 @@ class Seq2SeqCMTAgent(BaseAgent):
         # Record starting point
         traj = [{
             'instr_id': ob['instr_id'],
+            'scan': ob['scan'],
             'gt_path': ob['gt_path'],
             'gt_length': ob['distance'],
             'path': [(ob['viewpoint'], ob['heading'], ob['elevation'])],
@@ -402,17 +403,20 @@ class Seq2SeqCMTAgent(BaseAgent):
         #     path_act = [vp[0] for vp in traj[i]['path']]
         #     last_ndtw[i] = cal_dtw(self.env.shortest_distances[ob['scan']], path_act, ob['gt_path'])['nDTW']
 
+        if traj[0]['instr_id'] == '498_0':
+            k = 1
         # Initialization the tracking state
         ended = np.array([False] * batch_size)
 
         # Init the logs
+        inflection_list = [[] for _ in range(batch_size)]
+        loss_list = []
         rewards = []
         hidden_states = []
         policy_log_probs = []
         masks = []
         entropys = []
         ml_loss = 0.
-        lamd = 1.0
 
         # for backtrack
         visited = [set() for _ in range(batch_size)]
@@ -464,7 +468,12 @@ class Seq2SeqCMTAgent(BaseAgent):
             if train_ml is not None:
                 # Supervised training
                 target = self._teacher_action(not_ended_obs, ended)
-                ml_loss += self.criterion(logit, target) * lamd
+                step_loss = self.criterion(logit, target)
+                if self.args.inflection_weighting:
+                    loss_list.append(step_loss)
+                else:
+                    ml_loss += step_loss.sum()
+
 
             # # mask logit where the agent backtracks in observation in evaluation
             # if self.args.no_cand_backtrack:
@@ -522,7 +531,7 @@ class Seq2SeqCMTAgent(BaseAgent):
                 }
                 t_hist_embeds = self.vln_bert(**t_hist_inputs)
                 for i_batch, i_ended in enumerate(ended):
-                    if not i_ended:
+                    if not (i_ended or cpu_a_t[i_batch] == -1):
                         self.history_raw_length[i_batch] += 1
                         self.history[i_batch].append(t_hist_embeds[i_batch])
                         self.history_raw[i_batch][0].append(hist_img_feats[i_batch])
@@ -534,8 +543,15 @@ class Seq2SeqCMTAgent(BaseAgent):
 
                 
             # Make action and get the new state
-            obs = self.env.step(cpu_a_t, t=t+1, traj=traj)
+            obs, inflection = self.env.step(cpu_a_t, t=t+1, traj=traj)
             not_ended_obs = [ob for ob in obs if ob is not None]
+            if self.args.inflection_weighting:
+                for i_batch, i in enumerate(inflection):
+                    if not ended[i_batch] and cpu_a_t[i_batch] == -1:
+                        inflection_list[i_batch].append(2)
+                    else:
+                        inflection_list[i_batch].append(i)
+            
 
             # if train_rl:
             #     # Calculate the mask and reward
@@ -576,9 +592,6 @@ class Seq2SeqCMTAgent(BaseAgent):
             #     masks.append(mask)
             #     last_dist[:] = dist
             #     last_ndtw[:] = ndtw_score
-
-            if self.args.inflation_weighting is not None:
-                lamd += self.args.inflation_weighting
 
             ended[:] = np.logical_or(ended, (cpu_a_t == -1))
 
@@ -662,8 +675,20 @@ class Seq2SeqCMTAgent(BaseAgent):
             self._oracle_phrase()
             
         if train_ml is not None:
-            self.loss += ml_loss * train_ml / batch_size
-            self.logs['IL_loss'].append((ml_loss * train_ml / batch_size).item())
+            if self.args.inflection_weighting:
+                loss_list = torch.stack(loss_list).t()
+                tot_weight = 0
+                for i, inflections in enumerate(inflection_list):
+                    inflections = np.array(inflections, dtype=np.float)
+                    inflect_weight = (inflections > 0).sum() / (inflections == 2).sum()
+                    inflections[inflections == 2] = inflect_weight
+                    tot_weight += inflections.sum()
+                    ml_loss += (loss_list[i] * torch.from_numpy(inflections).cuda()).sum()
+                self.loss += ml_loss * train_ml / tot_weight
+                self.logs['IL_loss'].append((ml_loss * train_ml / tot_weight).item())
+            else:
+                self.loss += ml_loss * train_ml / batch_size
+                self.logs['IL_loss'].append((ml_loss * train_ml / batch_size).item())
 
         if type(self.loss) is int:  # For safety, it will be activated if no losses are added
             self.losses.append(0.)

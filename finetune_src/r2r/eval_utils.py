@@ -9,6 +9,7 @@ import jsonlines
 import time
 import math
 import h5py
+import dtw
 from collections import Counter, defaultdict
 import numpy as np
 import networkx as nx
@@ -107,3 +108,62 @@ def cal_cls(shortest_distances, prediction, reference, threshold=3.0):
     score = expected / (expected + np.abs(expected - length(prediction)))
     return coverage * score
     
+def extract_ep_order(path):
+    eps = [p["episode_id"] for p in path]
+    eps_single = []
+    for i in range(1, len(eps)):
+        if eps[i-1] != eps[i]:
+            eps_single.append(eps[i-1])
+    eps_single.append(eps[-1])
+    return eps_single
+
+def alignments_from_paths(agent_path, gt_path):
+    assert extract_ep_order(gt_path) == extract_ep_order(agent_path), (
+        "agent and GT episode orders do not match."
+    )
+
+    alen = len(agent_path)
+    gtlen = len(gt_path)
+
+    agent_alignment_points = []
+    for i in range(1, alen):
+        if agent_path[i]["episode_id"] != agent_path[i - 1]["episode_id"]:
+            agent_alignment_points.append(i - 1)  # stopping point
+            agent_alignment_points.append(i)  # starting point
+
+    gt_alignment_points = []
+    for i in range(1, gtlen):
+        if gt_path[i]["episode_id"] != gt_path[i - 1]["episode_id"]:
+            gt_alignment_points.append(i - 1)  # stopping point
+            gt_alignment_points.append(i)  # starting point
+
+    assert len(agent_alignment_points) == len(gt_alignment_points), (
+        "mismatch in number of alignment points."
+    )
+    return list(zip(agent_alignment_points, gt_alignment_points))
+
+def window_align_func(iw, jw, query_size, reference_size, alignments):
+    window = np.ones((query_size, reference_size), dtype=np.bool)
+
+    # for each alignment (i, j), make col j False except (i,j)
+    for (i, j) in alignments:
+        window[:, j] = False
+        window[:, j] = False
+        window[i, j] = True
+
+    return window
+
+def compute_tour_ndtw(agent_path, gt_path, dist_func, threshold=3.0):
+    # compute the constrained ndtw of each tour
+    alignments = alignments_from_paths(agent_path, gt_path)
+    ap = [p["position"] for p in agent_path]
+    gtp = [p["position"] for p in gt_path]
+    dtw_dist = dtw.dtw(
+        ap,
+        gtp,
+        dist_method=dist_func,
+        step_pattern="symmetric1",
+        window_type=window_align_func,
+        window_args={"alignments": alignments},
+    ).distance
+    return np.exp(-dtw_dist / (len(gtp) * threshold))

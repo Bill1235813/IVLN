@@ -1,7 +1,6 @@
 ''' Batched Room-to-Room navigation environment '''
 
 import json
-import os
 from itertools import chain
 import numpy as np
 import math
@@ -154,7 +153,26 @@ class R2RBatch(object):
         self.shortest_distances = {}
         for scan, G in self.graphs.items():  # compute all shortest paths
             self.shortest_distances[scan] = dict(nx.all_pairs_dijkstra_path_length(G))
-            
+        hash_count = 0
+        self.hash_node_map = {}
+        self.hash_distance_map = {}
+        for scan, scan_shortest in self.shortest_distances.items():
+            for s_node, node_shortest in scan_shortest.items():
+                if scan + '_' + s_node not in self.hash_node_map:
+                    self.hash_node_map[scan + '_' + s_node] = hash_count
+                    s_hash = hash_count
+                    hash_count += 1
+                else:
+                    s_hash = self.hash_node_map[scan + '_' + s_node]
+                for t_node, distance in node_shortest.items():
+                    if scan + '_' + t_node not in self.hash_node_map:
+                        self.hash_node_map[scan + '_' + t_node] = hash_count
+                        t_hash = hash_count
+                        hash_count += 1
+                    else:
+                        t_hash = self.hash_node_map[scan + '_' + t_node]
+                    self.hash_distance_map[s_hash * 100000 + t_hash] = distance
+                    
     def _get_gt_trajs(self, data):
         return {x['instr_id']: (x['scan'], x['path']) for x in data}
 
@@ -317,6 +335,14 @@ class R2RBatch(object):
                             angle_feat = angle_feature(loc['rel_heading'], loc['rel_elevation'], self.angle_feat_size)
                             path_view_id = loc['absViewIndex']
                             break
+                else:
+                    self.env.world_states[i] = WorldState(
+                        scan_id=state.scan_id,
+                        viewpoint_id=viewpoint_id,
+                        view_index=path_view_id,
+                        heading=(path_view_id - 12) * ANGLE_INC,
+                        elevation=0.0
+                    )
                 path_feats.append(feats)
                 angle_feats.append(angle_feat)
                 path_view_ids.append(path_view_id)
@@ -374,23 +400,33 @@ class R2RBatch(object):
         self.env.newEpisodes(scanIds, viewpointIds, headings)
         return self._get_obs(t=0)
 
-    def step(self, actions, t=None, traj=None):
+    def step(self, actions, t=None, traj=None, inflect_range=math.pi/3):
         ''' Take action (same interface as makeActions) '''
         full_actions = np.full(len(self.batch), -1, np.int64)
         counter = 0
         idmap = {}
+        old_headings = []
+        inflections = []
         for i, b in enumerate(self.batch):
             if b is not None:
                 full_actions[i] = actions[counter]
                 idmap[counter] = i
                 counter += 1
+                old_headings.append(self.env.world_states[i].heading)
         self.env.makeActions(full_actions)
         for i, action in enumerate(actions):
             if action >= 0 and traj is not None:
                 traj[i]['path'].append((self.env.world_states[idmap[i]].viewpoint_id,
                                         self.env.world_states[idmap[i]].heading,
                                         self.env.world_states[idmap[i]].elevation))
-        return self._get_obs(t=t)
+                if math.fabs(self.env.world_states[idmap[i]].heading - old_headings[i]) > inflect_range \
+                    or len(traj[i]['path']) == 1:
+                    inflections.append(2) # inflection
+                else:
+                    inflections.append(1) # not inflection
+            else:
+                inflections.append(0) # ended
+        return self._get_obs(t=t), inflections
 
 
     ############### Evaluation ###############
@@ -445,7 +481,9 @@ class R2RBatch(object):
             for k, v in traj_scores.items():
                 metrics[k].append(v)
             metrics['instr_id'].append(instr_id)
+            metrics['scan'].append(item['scan'])
             metrics['gt_path'].append(item['gt_path'])
+            metrics['agent_path'].append(item['trajectory'])
             metrics['gt_length'].append(item['gt_length'])
 
         

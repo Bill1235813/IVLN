@@ -12,7 +12,7 @@ def parse_args():
     parser.add_argument('--sep_hist', action='store_true', default=False, help='use separate tag for prev and curr hist')
     parser.add_argument('--rebuild', action='store_true', default=False,
                         help='rebuild hist after grad update')
-    parser.add_argument('--inflation_weighting', type=float, default=None, help='weight loss more as trajectory length grows')
+    parser.add_argument('--inflection_weighting', action='store_true', default=False, help='weight loss more as trajectory length grows')
 
     
     parser.add_argument('--root_dir', type=str, default='../datasets')
@@ -48,8 +48,6 @@ def parse_args():
     parser.add_argument("--resume_file", default=None, help='path of the trained model')
     parser.add_argument("--resume_optimizer", action="store_true", default=False)
     
-    parser.add_argument('--fast_epoch', action='store_true', default=False)
-
     # Augmented Paths from
     parser.add_argument("--aug", default=None)
     parser.add_argument('--bert_ckpt_file', default=None, help='init vlnbert')

@@ -9,7 +9,9 @@ class BaseAgent(object):
     def get_results(self, detailed_output=False):
         output = []
         for k, v in self.results.items():
-            output.append({'instr_id': k, 'trajectory': v['path'], 'gt_path': v['gt_path'], 'gt_length': v['gt_length']})
+            output.append({'instr_id': k, 'scan': v['scan'],
+                           'trajectory': v['path'], 'gt_path': v['gt_path'],
+                           'gt_length': v['gt_length']})
             if detailed_output:
                 output[-1]['details'] = v['details']
         return output
