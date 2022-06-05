@@ -38,7 +38,7 @@ iterative-vln
 ```
 
 
-## Run the baseline
+## Run the HAMT baseline
 HAMT Teacher-forcing IL
 ```baseline
 cd finetune_src
@@ -46,17 +46,20 @@ bash scripts/run_r2r_il.sh
 ```
 
 
-## Run the extended memory experiments
-```ext_mem
+## Run the TourHAMT model
+```tour_hamt
 cd finetune_src
-bash scripts/iter_train.sh
-bash scripts/iter_train_sep.sh              # with prev hist identifier
-bash scripts/iter_train_hist.sh             # train hist encoder
-bash scripts/iter_train_sep_hist.sh         # with prev hist identifier and train hist encoder
-bash scripts/iter_train_sep_weight.sh       # with prev hist identifier and inflection weighting
-bash scripts/iter_train_sep_hist_weight.sh  # all three above
+bash scripts/iter_train_sep_hist_weight.sh
 ```
 
+## TourHAMT Variations
+
+```var_tour_hamt
+cd finetune_src
+bash scripts/iter_train.sh                  # extended memory with prev episodes only
+bash scripts/iter_train_hist.sh             # train hist encoder
+bash scripts/iter_train_sep_hist.sh         # with prev hist identifier and train hist encoder
+```
 
 ## Citation
 If you find this work useful, please consider citing:
