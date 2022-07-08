@@ -6,7 +6,7 @@ networkx==2.5.1
 easydict==1.9
 lmdb==1.2.1
 numpy==1.21.4
-Pillow==8.4.0
+Pillow==9.0.1
 progressbar33==2.4
 tensorboardX==2.4
 transformers==4.12.3
