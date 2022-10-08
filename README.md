@@ -57,7 +57,7 @@ bash scripts/iter_train_sep_hist_weight.sh
 Model architecture:
 
 <p align="center">
-  <img width="851" height="583" src="./files/Model-THAMT.png" alt="IVLN">
+  <img width="640" height="437" src="./files/Model-THAMT.png" alt="IVLN">
 </p>
 
 ## TourHAMT Variations
