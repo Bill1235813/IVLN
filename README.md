@@ -2,7 +2,7 @@
 
 [Jacob Krantz*](https://jacobkrantz.github.io), [Shurjo Banerjee*](https://shurjobanerjee.github.io), [Wang Zhu](https://billzhu.me), [Jason Corso](https://web.eecs.umich.edu/~jjcorso), [Peter Anderson](https://panderson.me), [Stefan Lee](http://web.engr.oregonstate.edu/~leestef), and [Jesse Thomason](https://jessethomason.com)
 
-[[Paper](https://arxiv.org/abs/2210.03087)] [[Project Page](https://jacobkrantz.github.io/ivln)] [[GitHub (R2R part)](https://github.com/Bill1235813/IVLN)] [[GitHub (VLN-CE part)](https://github.com/jacobkrantz/IVLN-CE)]
+[[Paper](https://arxiv.org/abs/2210.03087)] [[Project Page](https://jacobkrantz.github.io/ivln)] [[GitHub (IVLN part)](https://github.com/Bill1235813/IVLN)] [[GitHub (VLN-CE part)](https://github.com/jacobkrantz/IVLN-CE)]
 
 This is the official implementation of **Iterative Vision-and-Language Navigation (IVLN) in discrete environments**, 
 a paradigm for evaluating language-guided agents navigating in a persistent environment over time. 
