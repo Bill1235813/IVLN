@@ -2,7 +2,7 @@
 
 [Jacob Krantz*](https://jacobkrantz.github.io), [Shurjo Banerjee*](https://shurjobanerjee.github.io), [Wang Zhu](https://billzhu.me), [Jason Corso](https://web.eecs.umich.edu/~jjcorso), [Peter Anderson](https://panderson.me), [Stefan Lee](http://web.engr.oregonstate.edu/~leestef), and [Jesse Thomason](https://jessethomason.com)
 
-[[Paper](https://arxiv.org/abs/2210.03087)] [[Project Page](https://jacobkrantz.github.io/ivln)] [[GitHub (IVLN part)](https://github.com/Bill1235813/IVLN)] [[GitHub (VLN-CE part)](https://github.com/jacobkrantz/IVLN-CE)]
+[[Paper](https://arxiv.org/abs/2210.03087)] [[Project Page](https://jacobkrantz.github.io/ivln)] [[GitHub (IVLN part)](https://github.com/Bill1235813/IVLN)] [[GitHub (IVLN-CE part)](https://github.com/jacobkrantz/IVLN-CE)]
 
 This is the official implementation of **Iterative Vision-and-Language Navigation (IVLN) in discrete environments**, 
 a paradigm for evaluating language-guided agents navigating in a persistent environment over time. 
@@ -24,7 +24,7 @@ pip install -r requirements.txt
 2. Download R2R data from [Dropbox](https://www.dropbox.com/sh/3a5j03u286px604/AABNp887W7_Fhgv13gUt4wzda?dl=0), including processed annotations, features and pretrained models. Put the data under *datasets* directory.
 
 3. Download Matterport 3D adjacency maps and angle features from [Dropbox](https://www.dropbox.com/sh/1jibefgj956rjbp/AAAx-ATXwrPk6NlLKFUW6DFsa?dl=0). Put the files under *datasets* directory. 
-4. Download the tour files for the original VLN-R2R and the prevalent augmented data from [GDrive](https://drive.google.com/drive/folders/1pALNPuAdSxtAKpUel9BNuy0Dn11_PZNP?usp=sharing). Put the files under the *iterative-vln* directory. The directory structure after this will be like
+4. Download the tour files for the original VLN-R2R and the prevalent augmented data from [GDrive](https://drive.google.com/drive/folders/13dRwcSYPlogzBK_CoN4jj2VkG8T0iE-T?usp=sharing). Put the files under the *iterative-vln* directory. The directory structure after this will be like
 ```directory
 iterative-vln
 |___finetune_src
